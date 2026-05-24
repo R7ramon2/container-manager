@@ -1,0 +1,1044 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  container-manager.sh — Gerenciador Multi-Container para Raspberry Pi
+#  Suporte: qualquer imagem Docker · macvlan · USB Passthrough · Monitor
+#  Autor: Ramon Alcântara
+#  Linkedin: https://www.linkedin.com/in/ramon-ranieri-276566150/
+# =============================================================================
+set -uo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFIGURAÇÕES GLOBAIS DE REDE
+# ─────────────────────────────────────────────────────────────────────────────
+
+HOST_INTERFACE="wlan0"
+LAN_SUBNET="192.168.1.0/24"
+LAN_GATEWAY="192.168.1.1"
+MACVLAN_NET="pi-macvlan"
+DATA_BASE="$HOME/containers"
+LOG_FILE="/var/log/container-manager.log"
+SERVICE_PREFIX="pi-container"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ARQUIVOS DE ESTADO
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONTAINERS_CONF="$DATA_BASE/.containers.conf"
+CATALOG_FILE="$DATA_BASE/.catalog.conf"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CATÁLOGO PADRÃO (gravado em $CATALOG_FILE na primeira execução)
+#  Formato: nome_amigavel|imagem:tag|ip_sugerido|descricao
+# ─────────────────────────────────────────────────────────────────────────────
+
+DEFAULT_CATALOG='kali-rolling|kalilinux/kali-rolling|192.168.1.50|Kali Linux (rolling) — pentest e segurança
+kali-bleeding|kalilinux/kali-bleeding-edge|192.168.1.51|Kali Bleeding Edge — ferramentas mais novas
+ubuntu-22|ubuntu:22.04|192.168.1.52|Ubuntu Server 22.04 LTS (Jammy)
+ubuntu-24|ubuntu:24.04|192.168.1.53|Ubuntu Server 24.04 LTS (Noble)
+debian-stable|debian:stable-slim|192.168.1.54|Debian Stable (slim)
+debian-bookworm|debian:bookworm|192.168.1.55|Debian Bookworm (completo)
+parrot-os|parrotsec/core:latest|192.168.1.56|Parrot OS Security Edition
+alpine|alpine:latest|192.168.1.57|Alpine Linux — ultraleve
+arch-linux|archlinux:latest|192.168.1.58|Arch Linux (rolling)
+fedora|fedora:latest|192.168.1.59|Fedora Linux (latest)
+raspbian|balenalib/raspberry-pi-debian:bullseye|192.168.1.60|Raspbian/Debian ARM
+centos-stream|quay.io/centos/centos:stream9|192.168.1.61|CentOS Stream 9
+kali-minimal|kalilinux/kali-last-release|192.168.1.62|Kali última release estável'
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CORES E HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m' B='\033[0;34m'
+P='\033[0;35m' C='\033[0;36m' W='\033[1;37m' DIM='\033[2m' RST='\033[0m'
+
+log()    { echo -e "${C}[$(date '+%H:%M:%S')]${RST} $*" | tee -a "$LOG_FILE" 2>/dev/null || true; }
+ok()     { echo -e " ${G}✔${RST} $*"; }
+warn()   { echo -e " ${Y}⚠${RST}  $*"; }
+err()    { echo -e " ${R}✘${RST}  $*" >&2; }
+info()   { echo -e " ${B}ℹ${RST}  $*"; }
+die()    { err "$*"; exit 1; }
+hr()     { echo -e "${DIM}$(printf '─%.0s' {1..62})${RST}"; }
+pause()  { echo; echo -n " Pressione Enter para continuar..."; read -r; }
+confirm(){ echo -ne " ${Y}${1:-Tem certeza?} [s/N]:${RST} "; read -r r; [[ "$r" =~ ^[sS]$ ]]; }
+
+require_root()   { [[ $EUID -eq 0 ]] || die "Execute como root: sudo $0"; }
+require_docker() {
+    command -v docker &>/dev/null   || die "Docker não encontrado. Use [I] para instalar."
+    docker info &>/dev/null 2>&1    || die "Docker daemon não responde. Rode: sudo systemctl start docker"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  INICIALIZAÇÃO
+# ─────────────────────────────────────────────────────────────────────────────
+
+init_state() {
+    mkdir -p "$DATA_BASE"
+    touch "$CONTAINERS_CONF"
+    # Grava catálogo padrão se ainda não existir
+    if [[ ! -f "$CATALOG_FILE" ]]; then
+        echo "$DEFAULT_CATALOG" > "$CATALOG_FILE"
+        log "Catálogo padrão criado em $CATALOG_FILE"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GERENCIAMENTO DO CATÁLOGO DE IMAGENS
+# ─────────────────────────────────────────────────────────────────────────────
+
+catalog_list() {
+    echo -e "\n ${W}┌─ Catálogo de Imagens ─────────────────────────────────────┐${RST}"
+    printf "  ${DIM}%-3s %-16s %-34s %-7s${RST}\n" "#" "NOME" "IMAGEM:TAG" "LOCAL?"
+    hr
+    local i=1
+    while IFS='|' read -r name image _ desc; do
+        [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+        # Verifica se a imagem já foi baixada localmente
+        local local_mark="${DIM}—${RST}"
+        if docker image inspect "$image" &>/dev/null 2>&1; then
+            local_mark="${G}sim${RST}"
+        fi
+        printf "  ${C}%-3s${RST} %-16s %-34s " "$i" "${name:0:15}" "${image:0:33}"
+        echo -e "$local_mark  ${DIM}${desc:0:28}${RST}"
+        (( i++ ))
+    done < "$CATALOG_FILE"
+    echo -e " ${W}└──────────────────────────────────────────────────────────────┘${RST}"
+}
+
+catalog_add() {
+    echo -e "\n ${P}◈ Adicionar Imagem ao Catálogo${RST}"
+    hr
+
+    echo -n "  Nome amigável (ex: meu-ubuntu): "; read -r name
+    [[ -z "$name" ]] && { warn "Nome não pode ser vazio."; return; }
+
+    # Verifica duplicata
+    if grep -q "^${name}|" "$CATALOG_FILE" 2>/dev/null; then
+        warn "Já existe uma entrada com o nome '${name}'."
+        confirm "Substituir?" || return
+        sed -i "/^${name}|/d" "$CATALOG_FILE"
+    fi
+
+    echo -n "  Imagem Docker (ex: ubuntu:20.04 ou nginx:alpine): "; read -r image
+    [[ -z "$image" ]] && { warn "Imagem não pode ser vazia."; return; }
+
+    # Sugere próximo IP disponível
+    local last_ip; last_ip=$(awk -F'|' 'NF>=3{print $3}' "$CATALOG_FILE" \
+        | grep -oP '\d+$' | sort -n | tail -1)
+    local next_ip="${LAN_GATEWAY%.*}.$((last_ip + 1))"
+    echo -n "  IP sugerido na LAN [${next_ip}]: "; read -r ip_in
+    local ip="${ip_in:-$next_ip}"
+
+    echo -n "  Descrição curta: "; read -r desc
+
+    echo "${name}|${image}|${ip}|${desc}" >> "$CATALOG_FILE"
+    ok "Imagem '${name}' adicionada ao catálogo."
+    info "Use a opção [pull] para baixar agora, ou ela será baixada ao criar um container."
+}
+
+catalog_edit() {
+    echo -e "\n ${P}◈ Editar Entrada do Catálogo${RST}"
+    catalog_list
+
+    echo -n "  Número da entrada para editar: "; read -r num
+    [[ ! "$num" =~ ^[0-9]+$ ]] && { warn "Número inválido."; return; }
+
+    local i=1 target_line=""
+    while IFS='|' read -r name image ip desc; do
+        [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+        if [[ $i -eq $num ]]; then
+            target_line="${name}|${image}|${ip}|${desc}"
+            break
+        fi
+        (( i++ ))
+    done < "$CATALOG_FILE"
+
+    [[ -z "$target_line" ]] && { warn "Entrada não encontrada."; return; }
+
+    IFS='|' read -r o_name o_image o_ip o_desc <<< "$target_line"
+    echo -e "\n  Editando: ${C}${o_name}${RST}"
+    echo -e "  ${DIM}(Enter para manter o valor atual)${RST}\n"
+
+    echo -n "  Nome amigável [${o_name}]: "; read -r n_name;   n_name="${n_name:-$o_name}"
+    echo -n "  Imagem:tag    [${o_image}]: "; read -r n_image; n_image="${n_image:-$o_image}"
+    echo -n "  IP sugerido   [${o_ip}]: ";   read -r n_ip;    n_ip="${n_ip:-$o_ip}"
+    echo -n "  Descrição     [${o_desc}]: "; read -r n_desc;  n_desc="${n_desc:-$o_desc}"
+
+    # Substitui linha no arquivo
+    sed -i "/^${o_name}|/d" "$CATALOG_FILE"
+    echo "${n_name}|${n_image}|${n_ip}|${n_desc}" >> "$CATALOG_FILE"
+
+    ok "Entrada '${n_name}' atualizada."
+    info "Se a tag da imagem mudou, use [pull] para baixar a nova versão."
+}
+
+catalog_remove() {
+    echo -e "\n ${P}◈ Remover Entrada do Catálogo${RST}"
+    catalog_list
+
+    echo -n "  Número da entrada para remover: "; read -r num
+    [[ ! "$num" =~ ^[0-9]+$ ]] && { warn "Número inválido."; return; }
+
+    local i=1 target_name=""
+    while IFS='|' read -r name _; do
+        [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+        if [[ $i -eq $num ]]; then target_name="$name"; break; fi
+        (( i++ ))
+    done < "$CATALOG_FILE"
+
+    [[ -z "$target_name" ]] && { warn "Entrada não encontrada."; return; }
+
+    confirm "Remover '${target_name}' do catálogo?" || return
+    sed -i "/^${target_name}|/d" "$CATALOG_FILE"
+    ok "'${target_name}' removido do catálogo."
+    info "Containers já criados com essa imagem não são afetados."
+}
+
+catalog_pull_one() {
+    # Baixa/atualiza a imagem de uma entrada específica do catálogo
+    local name=$1 image=$2
+    echo -e "\n ${B}↓${RST} Baixando ${W}${image}${RST}..."
+
+    local before_id=""
+    before_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || true)
+
+    if docker pull "$image" 2>&1 | tee -a "$LOG_FILE"; then
+        local after_id
+        after_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || true)
+
+        if [[ -n "$before_id" && "$before_id" == "$after_id" ]]; then
+            info "Imagem já estava na versão mais recente."
+        elif [[ -n "$before_id" && "$before_id" != "$after_id" ]]; then
+            ok "Imagem ${name} ATUALIZADA (nova camada disponível)."
+            warn "Containers existentes com essa imagem precisam ser recriados para usar a nova versão."
+            warn "Use a opção [17] no menu principal para recriar."
+        else
+            ok "Imagem ${name} baixada pela primeira vez."
+        fi
+    else
+        err "Falha ao baixar '${image}'. Verifique o nome e sua conexão."
+    fi
+}
+
+catalog_pull_menu() {
+    require_docker
+    echo -e "\n ${P}◈ Baixar / Atualizar Imagens${RST}"
+    echo -e " ${DIM}Verifica se há versão nova e baixa automaticamente.${RST}\n"
+
+    echo -e "  ${C}1)${RST} Baixar/atualizar UMA imagem do catálogo"
+    echo -e "  ${C}2)${RST} Baixar/atualizar TODAS as imagens do catálogo"
+    echo -e "  ${C}3)${RST} Digitar imagem manualmente (fora do catálogo)"
+    echo -e "  ${C}4)${RST} Ver imagens já baixadas localmente"
+    echo -e "  ${C}5)${RST} Limpar imagens antigas (dangling)"
+    echo -n "  Escolha: "; read -r opt
+
+    case "$opt" in
+        1)
+            catalog_list
+            echo -n "  Número da imagem: "; read -r num
+            [[ ! "$num" =~ ^[0-9]+$ ]] && { warn "Inválido."; return; }
+            local i=1
+            while IFS='|' read -r name image _ _; do
+                [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+                if [[ $i -eq $num ]]; then catalog_pull_one "$name" "$image"; break; fi
+                (( i++ ))
+            done < "$CATALOG_FILE"
+            ;;
+        2)
+            local total=0 updated=0 failed=0
+            echo ""
+            while IFS='|' read -r name image _ _; do
+                [[ "$name" =~ ^#.*$ || -z "$name" ]] && continue
+                (( total++ ))
+                catalog_pull_one "$name" "$image" && (( updated++ )) || (( failed++ ))
+                echo ""
+            done < "$CATALOG_FILE"
+            echo -e "\n ${W}Resumo:${RST} ${total} imagens · ${G}${updated} ok${RST} · ${R}${failed} falhas${RST}"
+            ;;
+        3)
+            echo -n "  Imagem (ex: nginx:1.25-alpine): "; read -r img
+            [[ -z "$img" ]] && return
+            catalog_pull_one "manual" "$img"
+            confirm "Adicionar '${img}' ao catálogo?" && {
+                echo -n "  Nome amigável: "; read -r nm
+                echo -n "  Descrição: "; read -r dc
+                local last_ip; last_ip=$(awk -F'|' 'NF>=3{print $3}' "$CATALOG_FILE" \
+                    | grep -oP '\d+$' | sort -n | tail -1)
+                local nip="${LAN_GATEWAY%.*}.$((last_ip + 1))"
+                echo "${nm:-custom}|${img}|${nip}|${dc}" >> "$CATALOG_FILE"
+                ok "Adicionado ao catálogo."
+            }
+            ;;
+        4)
+            echo -e "\n ${W}Imagens Docker locais:${RST}"
+            docker images --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}" \
+                | head -40
+            ;;
+        5)
+            local dangling; dangling=$(docker images -f "dangling=true" -q 2>/dev/null | wc -l)
+            if [[ "$dangling" -gt 0 ]]; then
+                info "${dangling} imagem(ns) antigas encontradas."
+                confirm "Remover imagens dangling (antigas/sem tag)?" && \
+                    docker image prune -f && ok "Imagens limpas." || true
+            else
+                info "Nenhuma imagem antiga para limpar."
+            fi
+            ;;
+        *) warn "Opção inválida." ;;
+    esac
+}
+
+catalog_menu() {
+    while true; do
+        clear
+        echo -e "\n ${P}◈ Gerenciador de Catálogo de Imagens${RST}"
+        hr
+        catalog_list
+        echo ""
+        echo -e "  ${G}a)${RST} Adicionar nova imagem ao catálogo"
+        echo -e "  ${Y}e)${RST} Editar entrada existente (nome, tag, IP)"
+        echo -e "  ${R}r)${RST} Remover entrada do catálogo"
+        echo -e "  ${B}p)${RST} Baixar / atualizar imagens"
+        echo -e "  ${DIM}v)${RST} Ver imagens locais (docker images)"
+        echo -e "  ${DIM}q)${RST} Voltar ao menu principal"
+        echo -n "  Opção: "; read -r opt
+
+        case "$opt" in
+            a) catalog_add ;;
+            e) catalog_edit ;;
+            r) catalog_remove ;;
+            p) catalog_pull_menu ;;
+            v) echo ""; docker images; echo "" ;;
+            q|Q) return ;;
+            *) warn "Opção inválida." ;;
+        esac
+        pause
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MONITOR DE RECURSOS DO HOST
+# ─────────────────────────────────────────────────────────────────────────────
+
+get_cpu_percent() {
+    local s1 s2
+    s1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
+    sleep 0.5
+    s2=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5}' /proc/stat)
+    local t1 i1 t2 i2
+    read -r t1 i1 <<< "$s1"; read -r t2 i2 <<< "$s2"
+    local dt=$(( t2 - t1 )); local di=$(( i2 - i1 ))
+    [[ $dt -eq 0 ]] && echo "0" || echo $(( (dt - di) * 100 / dt ))
+}
+
+get_ram_info() {
+    awk '/MemTotal/{t=$2} /MemAvailable/{a=$2}
+         END{u=t-a; printf "%d %d %d %d", t/1024, u/1024, a/1024, u*100/t}' /proc/meminfo
+}
+
+get_cpu_temp() {
+    local tf="/sys/class/thermal/thermal_zone0/temp"
+    [[ -f "$tf" ]] && echo "$(( $(cat "$tf") / 1000 ))°C" || echo "N/A"
+}
+
+get_disk_info() {
+    df -BM / | awk 'NR==2{gsub("M","",$2); gsub("M","",$3); gsub("M","",$4);
+        printf "%d %d %d %d", $2, $3, $4, $3*100/$2}'
+}
+
+color_bar() {
+    local pct=${1:-0} width=${2:-20}
+    local filled=$(( pct * width / 100 ))
+    [[ $filled -gt $width ]] && filled=$width
+    local color
+    if   [[ $pct -lt 60 ]]; then color="$G"
+    elif [[ $pct -lt 80 ]]; then color="$Y"
+    else                         color="$R"; fi
+    printf "${color}"; printf '█%.0s' $(seq 1 $filled 2>/dev/null)
+    printf "${DIM}"; printf '░%.0s' $(seq 1 $(( width - filled )) 2>/dev/null)
+    printf "${RST}"
+}
+
+show_host_resources() {
+    local cpu; cpu=$(get_cpu_percent)
+    local ram_t ram_u ram_a ram_pct
+    read -r ram_t ram_u ram_a ram_pct <<< "$(get_ram_info)"
+    local disk_t disk_u disk_a disk_pct
+    read -r disk_t disk_u disk_a disk_pct <<< "$(get_disk_info)"
+    local temp; temp=$(get_cpu_temp)
+
+    echo -e " ${W}┌─ Host: Raspberry Pi ─────────────────────────────────────┐${RST}"
+    printf "  ${W}CPU   ${RST} %s %3d%%  ${DIM}(%s cores · %s)${RST}\n" \
+        "$(color_bar "$cpu" 20)" "$cpu" "$(nproc)" "$temp"
+    printf "  ${W}RAM   ${RST} %s %3d%%  ${DIM}(%s MB / %s MB)${RST}\n" \
+        "$(color_bar "$ram_pct" 20)" "$ram_pct" "$ram_u" "$ram_t"
+    printf "  ${W}DISCO ${RST} %s %3d%%  ${DIM}(%s MB / %s MB)${RST}\n" \
+        "$(color_bar "$disk_pct" 20)" "$disk_pct" "$disk_u" "$disk_t"
+    echo -e " ${W}└──────────────────────────────────────────────────────────┘${RST}"
+}
+
+show_container_resources() {
+    require_docker
+    local running; running=$(docker ps -q 2>/dev/null | wc -l)
+    [[ "$running" -eq 0 ]] && return
+
+    echo -e "\n ${W}┌─ Recursos por Container ─────────────────────────────────┐${RST}"
+    printf "  ${DIM}%-20s %-9s %-14s %-12s${RST}\n" "CONTAINER" "CPU%" "RAM" "NET I/O"
+    hr
+
+    docker stats --no-stream --format \
+        "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}" 2>/dev/null \
+    | while IFS='|' read -r name cpu mem net; do
+        local cpuval; cpuval=$(echo "$cpu" | tr -d '%' | cut -d'.' -f1)
+        cpuval=${cpuval:-0}
+        local color
+        if   [[ $cpuval -lt 50 ]]; then color="$G"
+        elif [[ $cpuval -lt 80 ]]; then color="$Y"
+        else                            color="$R"; fi
+        printf "  %-20s ${color}%-9s${RST} %-14s %-12s\n" \
+            "${name:0:19}" "$cpu" "${mem:0:13}" "${net:0:11}"
+    done
+
+    echo -e " ${W}└──────────────────────────────────────────────────────────┘${RST}"
+}
+
+monitor_live() {
+    echo -e "${Y} Monitor ao vivo — Ctrl+C para sair${RST}\n"
+    while true; do
+        clear
+        echo -e " ${P}◈ Monitor de Recursos  ${DIM}$(date '+%d/%m/%Y %H:%M:%S')${RST}"
+        hr
+        show_host_resources
+        show_container_resources
+        echo -e "\n ${DIM}Atualiza a cada 3s · Ctrl+C para sair${RST}"
+        sleep 3
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DISPOSITIVOS USB
+# ─────────────────────────────────────────────────────────────────────────────
+
+list_usb_devices() {
+    echo -e "\n ${W}┌─ Dispositivos USB Detectados ───────────────────────────┐${RST}"
+
+    local found=false
+    for d in /dev/ttyUSB* /dev/ttyACM* /dev/cdc-wdm*; do
+        [[ -e "$d" ]] && { echo -e "  ${B}[modem/serial]${RST} $d"; found=true; }
+    done
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && { echo -e "  ${C}[storage]${RST} $line"; found=true; }
+    done < <(lsblk -ndo NAME,TYPE,SIZE 2>/dev/null | awk '$2=="disk"{print "/dev/"$1"  ("$3")"}')
+
+    [[ "$found" == false ]] && echo -e "  ${DIM}Nenhum dispositivo USB de bloco/serial detectado.${RST}"
+
+    if command -v lsusb &>/dev/null; then
+        echo -e "\n  ${DIM}Todos os dispositivos USB (lsusb):${RST}"
+        lsusb 2>/dev/null | while read -r line; do
+            echo -e "  ${DIM}$line${RST}"
+        done
+    fi
+
+    echo -e " ${W}└──────────────────────────────────────────────────────────┘${RST}"
+}
+
+select_usb_for_container() {
+    local usb_list=()
+    for d in /dev/ttyUSB* /dev/ttyACM* /dev/cdc-wdm* /dev/net/tun; do
+        [[ -e "$d" ]] && usb_list+=("$d")
+    done
+    while IFS= read -r d; do
+        [[ -n "$d" ]] && usb_list+=("$d")
+    done < <(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print "/dev/"$1}')
+
+    if [[ ${#usb_list[@]} -eq 0 ]]; then
+        warn "Nenhum dispositivo USB encontrado no momento."; echo ""; return
+    fi
+
+    echo -e "\n ${W}Dispositivos disponíveis:${RST}"
+    local i=1
+    for d in "${usb_list[@]}"; do echo -e "  ${C}$i)${RST} $d"; (( i++ )); done
+    echo -e "  ${DIM}0) Nenhum${RST}"
+    echo -n "  Escolha (ex: 1 3): "; read -r choices
+
+    local flags=""
+    for c in $choices; do
+        [[ "$c" == "0" ]] && continue
+        local idx=$(( c - 1 ))
+        if [[ $idx -ge 0 && $idx -lt ${#usb_list[@]} ]]; then
+            flags+=" --device=${usb_list[$idx]}"
+        fi
+    done
+    echo "$flags"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  REDE MACVLAN
+# ─────────────────────────────────────────────────────────────────────────────
+
+ensure_macvlan() {
+    docker network ls --format '{{.Name}}' 2>/dev/null | grep -q "^${MACVLAN_NET}$" && return 0
+    log "Criando rede macvlan '${MACVLAN_NET}'..."
+    local host_ip; host_ip=$(ip -4 addr show "$HOST_INTERFACE" 2>/dev/null \
+        | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+    local aux="${host_ip%.*}.254/32"
+    docker network create -d macvlan \
+        --subnet="$LAN_SUBNET" --gateway="$LAN_GATEWAY" \
+        --ip-range="$aux" -o parent="$HOST_INTERFACE" "$MACVLAN_NET" \
+        || die "Falha ao criar rede macvlan."
+    ok "Rede macvlan criada."
+}
+
+ensure_host_bridge() {
+    ip link show macvlan0 &>/dev/null 2>&1 && return 0
+    local host_ip; host_ip=$(ip -4 addr show "$HOST_INTERFACE" 2>/dev/null \
+        | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+    ip link add macvlan0 link "$HOST_INTERFACE" type macvlan mode bridge 2>/dev/null || true
+    ip addr add "${host_ip%.*}.254/32" dev macvlan0 2>/dev/null || true
+    ip link set macvlan0 up 2>/dev/null || true
+    [[ -f "$CONTAINERS_CONF" ]] && while IFS='|' read -r _ _ cip _ _; do
+        [[ -n "$cip" ]] && ip route add "$cip/32" dev macvlan0 2>/dev/null || true
+    done < "$CONTAINERS_CONF"
+    ok "Bridge host-side (macvlan0) configurada."
+}
+
+remove_macvlan() {
+    ip link set macvlan0 down 2>/dev/null || true
+    ip link delete macvlan0 2>/dev/null || true
+    docker network rm "$MACVLAN_NET" 2>/dev/null || true
+    ok "Rede macvlan removida."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GERENCIAMENTO DE CONTAINERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+save_container() {
+    local name=$1 image=$2 ip=$3 auto=$4 usb=${5:-""}
+    grep -v "^${name}|" "$CONTAINERS_CONF" > "${CONTAINERS_CONF}.tmp" 2>/dev/null || true
+    echo "${name}|${image}|${ip}|${auto}|${usb}" >> "${CONTAINERS_CONF}.tmp"
+    mv "${CONTAINERS_CONF}.tmp" "$CONTAINERS_CONF"
+}
+
+remove_container_conf() {
+    grep -v "^${1}|" "$CONTAINERS_CONF" > "${CONTAINERS_CONF}.tmp" 2>/dev/null || true
+    mv "${CONTAINERS_CONF}.tmp" "$CONTAINERS_CONF"
+}
+
+get_container_ip() {
+    docker inspect "$1" 2>/dev/null \
+    | python3 -c "
+import sys,json
+try:
+    d=json.load(sys.stdin)
+    nets=d[0]['NetworkSettings']['Networks']
+    print(list(nets.values())[0].get('IPAddress',''))
+except: print('')
+" 2>/dev/null || echo ""
+}
+
+create_container_run() {
+    # Cria e sobe o container com base nos parâmetros
+    local name=$1 image=$2 ip=$3 usb_flags="${4:-}"
+    local data_dir="$DATA_BASE/$name"
+    mkdir -p "$data_dir/data" "$data_dir/tools"
+
+    docker run -d \
+        --name "$name" \
+        --network "$MACVLAN_NET" \
+        --ip "$ip" \
+        --hostname "$name" \
+        --privileged \
+        --cap-add=NET_ADMIN \
+        --cap-add=NET_RAW \
+        -v "${data_dir}/data:/root/persistent" \
+        -v "${data_dir}/tools:/opt/tools" \
+        -e LANG=pt_BR.UTF-8 \
+        --restart=unless-stopped \
+        ${usb_flags} \
+        "$image" \
+        bash -c '
+            export DEBIAN_FRONTEND=noninteractive
+            if   command -v apt-get >/dev/null 2>&1; then
+                apt-get update -qq 2>/dev/null
+                apt-get install -y -qq openssh-server iproute2 curl wget net-tools 2>/dev/null || true
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache openssh iproute2 curl wget 2>/dev/null || true
+                ssh-keygen -A 2>/dev/null || true
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y openssh-server iproute curl wget 2>/dev/null || true
+            elif command -v pacman >/dev/null 2>&1; then
+                pacman -Sy --noconfirm openssh iproute2 curl wget 2>/dev/null || true
+            elif command -v zypper >/dev/null 2>&1; then
+                zypper -n install openssh iproute2 curl wget 2>/dev/null || true
+            fi
+            mkdir -p /run/sshd /var/run/sshd
+            echo "root:raspberry" | chpasswd 2>/dev/null || true
+            sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i "s/PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true
+            (which /usr/sbin/sshd && /usr/sbin/sshd) 2>/dev/null \
+                || (which sshd && sshd) 2>/dev/null || true
+            tail -f /dev/null
+        ' 2>&1
+}
+
+add_new_container() {
+    require_root; require_docker
+    echo -e "\n ${P}◈ Adicionar Novo Container${RST}"
+    hr
+
+    # Fonte da imagem
+    echo -e "\n  ${W}De onde vem a imagem?${RST}"
+    echo -e "  ${C}1)${RST} Escolher do catálogo"
+    echo -e "  ${C}2)${RST} Digitar imagem manualmente"
+    echo -n "  Escolha: "; read -r src
+
+    local name image suggested_ip desc
+
+    if [[ "$src" == "1" ]]; then
+        catalog_list
+        echo -n "  Número no catálogo: "; read -r num
+        [[ ! "$num" =~ ^[0-9]+$ ]] && { warn "Inválido."; return; }
+        local i=1
+        while IFS='|' read -r cn ci cip cd; do
+            [[ "$cn" =~ ^#.*$ || -z "$cn" ]] && continue
+            if [[ $i -eq $num ]]; then
+                name="$cn"; image="$ci"; suggested_ip="$cip"; desc="$cd"; break
+            fi
+            (( i++ ))
+        done < "$CATALOG_FILE"
+        [[ -z "${name:-}" ]] && { warn "Entrada não encontrada."; return; }
+        echo -e "  Selecionado: ${G}${name}${RST} (${image})"
+        echo -n "  Nome do container [${name}]: "; read -r name_in
+        [[ -n "$name_in" ]] && name="$name_in"
+        echo -n "  IP na LAN [${suggested_ip}]: "; read -r ip_in
+        [[ -n "$ip_in" ]] && suggested_ip="$ip_in"
+    else
+        echo -n "  Imagem (ex: ubuntu:20.04): "; read -r image
+        [[ -z "$image" ]] && { warn "Imagem não pode ser vazia."; return; }
+        echo -n "  Nome do container: "; read -r name
+        [[ -z "$name" ]] && name="${image%%:*}"
+        local last_ip; last_ip=$(awk -F'|' 'NF>=3{print $3}' "$CATALOG_FILE" \
+            | grep -oP '\d+$' | sort -n | tail -1)
+        suggested_ip="${LAN_GATEWAY%.*}.$((last_ip + 1))"
+        echo -n "  IP na LAN [${suggested_ip}]: "; read -r ip_in
+        [[ -n "$ip_in" ]] && suggested_ip="$ip_in"
+        confirm "Adicionar '${image}' ao catálogo também?" && {
+            echo -n "  Descrição: "; read -r cdesc
+            echo "${name}|${image}|${suggested_ip}|${cdesc:-Adicionado manualmente}" >> "$CATALOG_FILE"
+            ok "Adicionado ao catálogo."
+        }
+    fi
+
+    # Verifica duplicata
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        warn "Container '${name}' já existe."; return
+    fi
+
+    # Autostart
+    echo -n "  Iniciar automaticamente com o Raspberry? [s/N]: "; read -r au
+    local autostart="no"; [[ "$au" =~ ^[sS]$ ]] && autostart="yes"
+
+    # USB
+    echo -n "  Configurar passthrough de USB? [s/N]: "; read -r usb_ask
+    local usb_flags=""
+    [[ "$usb_ask" =~ ^[sS]$ ]] && usb_flags=$(select_usb_for_container)
+
+    # Baixa imagem se necessário
+    if ! docker image inspect "$image" &>/dev/null 2>&1; then
+        log "Imagem '${image}' não encontrada localmente. Baixando..."
+        docker pull "$image" || { err "Falha ao baixar imagem."; return; }
+    else
+        info "Imagem '${image}' já está local."
+        confirm "Verificar se há atualização disponível?" && docker pull "$image"
+    fi
+
+    ensure_macvlan
+    ensure_host_bridge
+
+    log "Criando container '${name}' com IP ${suggested_ip}..."
+    if create_container_run "$name" "$image" "$suggested_ip" "$usb_flags"; then
+        save_container "$name" "$image" "$suggested_ip" "$autostart" "$usb_flags"
+        ip route add "${suggested_ip}/32" dev macvlan0 2>/dev/null || true
+        [[ "$autostart" == "yes" ]] && install_container_service "$name"
+
+        ok "Container '${name}' criado com sucesso!"
+        echo -e "  ${DIM}IP    :${RST} ${C}${suggested_ip}${RST}"
+        echo -e "  ${DIM}SSH   :${RST} ssh root@${suggested_ip}  ${DIM}(senha: raspberry)${RST}"
+        echo -e "  ${DIM}Shell :${RST} sudo docker exec -it ${name} bash"
+    else
+        err "Falha ao criar container '${name}'."
+    fi
+}
+
+start_container() {
+    local name=$1; require_docker
+    ensure_macvlan; ensure_host_bridge
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$" \
+        && { warn "'${name}' já está rodando."; return; }
+    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$" \
+        || { err "Container '${name}' não encontrado."; return; }
+    log "Iniciando '${name}'..."
+    docker start "$name"
+    local ip; ip=$(get_container_ip "$name")
+    [[ -n "$ip" ]] && ip route add "${ip}/32" dev macvlan0 2>/dev/null || true
+    ok "'${name}' iniciado — IP: ${C}${ip}${RST}"
+}
+
+stop_container() {
+    local name=$1; require_docker
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$" \
+        || { warn "'${name}' não está rodando."; return; }
+    log "Parando '${name}'..."; docker stop "$name"; ok "'${name}' parado."
+}
+
+remove_container() {
+    local name=$1; require_root; require_docker
+    confirm "Remover container '${name}' permanentemente?" || return
+    docker stop "$name" 2>/dev/null || true
+    docker rm "$name" 2>/dev/null || true
+    remove_container_conf "$name"
+    local svc="${SERVICE_PREFIX}-${name}"
+    systemctl disable "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${svc}.service"
+    systemctl daemon-reload 2>/dev/null || true
+    ok "'${name}' removido."
+    confirm "Remover dados persistentes em $DATA_BASE/$name?" && rm -rf "$DATA_BASE/$name" && ok "Dados removidos."
+}
+
+shell_into() {
+    local name=$1; require_docker
+    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$" || {
+        warn "'${name}' não está rodando. Iniciando..."; start_container "$name"; sleep 2
+    }
+    log "Shell em '${name}'..."
+    docker exec -it "$name" bash 2>/dev/null || docker exec -it "$name" sh
+}
+
+update_container_image() {
+    local name=$1; require_docker
+    local image; image=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f2)
+    [[ -z "$image" ]] && { err "Container '${name}' não encontrado na configuração."; return; }
+
+    echo -e "\n ${B}↓${RST} Verificando atualização para ${W}${image}${RST}..."
+    local before_id; before_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || true)
+    docker pull "$image"
+    local after_id; after_id=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null || true)
+
+    if [[ "$before_id" == "$after_id" ]]; then
+        info "Já estava na versão mais recente. Nenhuma ação necessária."
+        return
+    fi
+
+    ok "Nova versão disponível!"
+    confirm "Recriar o container para usar a nova imagem? (dados persistentes mantidos)" || return
+
+    local ip; ip=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f3)
+    local auto; auto=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f4)
+    local usb; usb=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f5)
+
+    stop_container "$name"
+    docker rm "$name"
+
+    if create_container_run "$name" "$image" "$ip" "$usb"; then
+        ok "Container '${name}' recriado com imagem atualizada."
+    else
+        err "Falha ao recriar. Dados em $DATA_BASE/$name estão intactos."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SYSTEMD
+# ─────────────────────────────────────────────────────────────────────────────
+
+install_container_service() {
+    local name=$1
+    local svc="${SERVICE_PREFIX}-${name}"
+    local ip; ip=$(grep "^${name}|" "$CONTAINERS_CONF" 2>/dev/null | cut -d'|' -f3)
+
+    cat > "/etc/systemd/system/${svc}.service" << EOF
+[Unit]
+Description=Container Manager — ${name}
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 8
+ExecStartPre=-/sbin/ip link add macvlan0 link ${HOST_INTERFACE} type macvlan mode bridge
+ExecStartPre=-/sbin/ip addr add ${LAN_GATEWAY%.*}.254/32 dev macvlan0
+ExecStartPre=-/sbin/ip link set macvlan0 up
+ExecStartPre=-/sbin/ip route add ${ip}/32 dev macvlan0
+ExecStartPre=/bin/bash -c "docker network ls | grep -q ${MACVLAN_NET} || docker network create -d macvlan --subnet=${LAN_SUBNET} --gateway=${LAN_GATEWAY} -o parent=${HOST_INTERFACE} ${MACVLAN_NET}"
+ExecStart=/usr/bin/docker start ${name}
+ExecStop=/usr/bin/docker stop -t 10 ${name}
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$svc"
+    ok "Serviço '${svc}' instalado e habilitado."
+}
+
+toggle_autostart() {
+    local name=$1; require_root
+    local svc="${SERVICE_PREFIX}-${name}"
+    if systemctl is-enabled "$svc" &>/dev/null 2>&1; then
+        systemctl disable "$svc"
+        rm -f "/etc/systemd/system/${svc}.service"
+        systemctl daemon-reload
+        sed -i "s/^${name}|\([^|]*\)|\([^|]*\)|yes|/${name}|\1|\2|no|/" "$CONTAINERS_CONF" 2>/dev/null || true
+        warn "Autostart desabilitado para '${name}'."
+    else
+        install_container_service "$name"
+        sed -i "s/^${name}|\([^|]*\)|\([^|]*\)|no|/${name}|\1|\2|yes|/" "$CONTAINERS_CONF" 2>/dev/null || true
+        ok "Autostart habilitado para '${name}'."
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  INSTALAÇÃO DE DEPENDÊNCIAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+install_deps() {
+    require_root
+    log "Atualizando repositórios..."
+    apt-get update -qq
+    local pkgs=()
+    command -v docker  &>/dev/null || pkgs+=(docker.io)
+    command -v python3 &>/dev/null || pkgs+=(python3)
+    command -v lsusb   &>/dev/null || pkgs+=(usbutils)
+    command -v nsenter &>/dev/null || pkgs+=(util-linux)
+    [[ ${#pkgs[@]} -gt 0 ]] && apt-get install -y "${pkgs[@]}"
+    systemctl enable --now docker
+    usermod -aG docker "${SUDO_USER:-pi}" 2>/dev/null || true
+    ok "Dependências instaladas."
+    info "Faça logout/login se o usuário foi adicionado ao grupo docker."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SELEÇÃO DE CONTAINER
+# ─────────────────────────────────────────────────────────────────────────────
+
+SELECTED_CONTAINER=""
+
+select_container() {
+    local prompt="${1:-Selecione o container}"
+    local containers=()
+    [[ ! -f "$CONTAINERS_CONF" ]] && { err "Nenhum container configurado."; return 1; }
+    while IFS='|' read -r name _; do [[ -n "$name" ]] && containers+=("$name"); done < "$CONTAINERS_CONF"
+    [[ ${#containers[@]} -eq 0 ]] && { err "Nenhum container configurado."; return 1; }
+
+    echo -e "\n ${W}${prompt}:${RST}"
+    local i=1
+    for c in "${containers[@]}"; do echo -e "  ${C}$i)${RST} $c"; (( i++ )); done
+    echo -n "  Escolha: "; read -r choice
+
+    if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#containers[@]} ]]; then
+        SELECTED_CONTAINER="${containers[$((choice-1))]}"; return 0
+    else
+        warn "Opção inválida."; return 1
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+banner() {
+    clear
+    echo -e "${P}${W}"
+    echo "  ╔═══════════════════════════════════════════════════════╗"
+    echo "  ║       Container Manager — Raspberry Pi               ║"
+    echo "  ║       Multi-OS · macvlan · USB · Catálogo            ║"
+    echo "  ╚═══════════════════════════════════════════════════════╝${RST}"
+    echo ""
+    show_host_resources
+    echo ""
+
+    if [[ -f "$CONTAINERS_CONF" ]] && [[ -s "$CONTAINERS_CONF" ]]; then
+        echo -e " ${W}┌─ Containers ────────────────────────────────────────────┐${RST}"
+        printf "  ${DIM}%-3s %-18s %-16s %-16s %-8s %-4s${RST}\n" "#" "NOME" "IMAGEM" "IP" "STATUS" "AUTO"
+
+        local idx=1
+        while IFS='|' read -r name image ip autostart usb; do
+            [[ -z "$name" ]] && continue
+            local status_str ip_str
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+                status_str="${G}● running${RST}"
+                ip_str="${C}${ip}${RST}"
+            elif docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+                status_str="${Y}● stopped${RST}"; ip_str="${DIM}${ip}${RST}"
+            else
+                status_str="${R}● ausente${RST}"; ip_str="${DIM}—${RST}"
+            fi
+            local auto_str usb_mark=""
+            [[ "$autostart" == "yes" ]] && auto_str="${G}sim${RST}" || auto_str="${DIM}não${RST}"
+            [[ -n "${usb// /}" ]] && usb_mark=" ${B}[usb]${RST}"
+
+            printf "  ${C}%-3s${RST} %-18s %-16s " "$idx" "${name:0:17}" "${image##*/}"
+            echo -e "$ip_str   $status_str   $auto_str$usb_mark"
+            (( idx++ ))
+        done < "$CONTAINERS_CONF"
+        echo -e " ${W}└──────────────────────────────────────────────────────────┘${RST}"
+        echo ""
+    fi
+}
+
+menu() {
+    echo -e " ${W}Containers${RST}"
+    echo -e "  ${G}1${RST}) Adicionar novo container"
+    echo -e "  ${C}2${RST}) Iniciar   ${R}3${RST}) Parar   ${Y}4${RST}) Reiniciar   ${B}5${RST}) Remover"
+    echo -e "  ${C}6${RST}) Shell     ${C}7${RST}) Logs    ${B}8${RST}) Status detalhado"
+    echo ""
+    echo -e " ${W}Catálogo de Imagens${RST}"
+    echo -e "  ${P}C${RST}) Gerenciar catálogo (adicionar · editar · pull · atualizar)"
+    echo -e "  ${P}U${RST}) Atualizar imagem de um container (pull + recriar)"
+    echo ""
+    echo -e " ${W}USB & Rede${RST}"
+    echo -e "  ${B}9${RST}) Listar dispositivos USB"
+    echo -e "  ${B}10${RST}) Adicionar USB a container"
+    echo -e "  ${C}11${RST}) Reconfigurar rede macvlan"
+    echo -e "  ${C}12${RST}) Testar conectividade (ping)"
+    echo ""
+    echo -e " ${W}Monitor${RST}"
+    echo -e "  ${P}13${RST}) Monitor ao vivo (tempo real)"
+    echo -e "  ${P}14${RST}) Snapshot de recursos"
+    echo ""
+    echo -e " ${W}Sistema${RST}"
+    echo -e "  ${P}15${RST}) Toggle autostart de container"
+    echo -e "  ${Y}I${RST})  Instalar dependências"
+    echo -e "  ${R}18${RST}) Reset total"
+    echo -e "  ${R}q${RST})  Sair"
+    echo ""
+    echo -n " Opção: "
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  AÇÕES RÁPIDAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+do_action() {
+    local action=$1
+    select_container "Selecione o container" || return
+    case "$action" in
+        start)   start_container "$SELECTED_CONTAINER" ;;
+        stop)    stop_container  "$SELECTED_CONTAINER" ;;
+        restart) stop_container  "$SELECTED_CONTAINER"; sleep 2; start_container "$SELECTED_CONTAINER" ;;
+        remove)  remove_container "$SELECTED_CONTAINER" ;;
+        shell)   shell_into      "$SELECTED_CONTAINER" ;;
+        logs)    docker logs -f --tail=80 "$SELECTED_CONTAINER" ;;
+        status)
+            echo ""
+            docker inspect "$SELECTED_CONTAINER" --format \
+"  Nome    : {{.Name}}
+  Estado  : {{.State.Status}}
+  Iniciou : {{.State.StartedAt}}
+  Imagem  : {{.Config.Image}}
+  Restart : {{.HostConfig.RestartPolicy.Name}}
+  Pid     : {{.State.Pid}}" 2>/dev/null
+            echo ""
+            docker stats "$SELECTED_CONTAINER" --no-stream --format \
+"  CPU     : {{.CPUPerc}}
+  RAM     : {{.MemUsage}} ({{.MemPerc}})
+  Net I/O : {{.NetIO}}
+  Block   : {{.BlockIO}}" 2>/dev/null || warn "Container não está rodando."
+            ;;
+        ping)
+            local ip; ip=$(get_container_ip "$SELECTED_CONTAINER")
+            [[ -z "$ip" ]] && ip=$(grep "^${SELECTED_CONTAINER}|" "$CONTAINERS_CONF" | cut -d'|' -f3)
+            info "Pingando ${ip}..."
+            ping -c4 -W2 "$ip" && ok "Acessível." || err "Sem resposta."
+            ;;
+        update)  update_container_image "$SELECTED_CONTAINER" ;;
+        autostart) toggle_autostart "$SELECTED_CONTAINER" ;;
+        usb)
+            echo -e "\n ${Y}Docker não suporta adicionar dispositivos a containers em execução.${RST}"
+            echo -e "  ${C}1)${RST} Recriar container com novo USB (recomendado)"
+            echo -e "  ${C}2)${RST} Cancelar"
+            echo -n "  Escolha: "; read -r uopt
+            if [[ "$uopt" == "1" ]]; then
+                local name="$SELECTED_CONTAINER"
+                local image ip auto usb
+                IFS='|' read -r _ image ip auto usb <<< "$(grep "^${name}|" "$CONTAINERS_CONF")"
+                local new_usb; new_usb=$(select_usb_for_container)
+                local combined="${usb} ${new_usb}"
+                stop_container "$name"; docker rm "$name"
+                create_container_run "$name" "$image" "$ip" "$combined"
+                save_container "$name" "$image" "$ip" "$auto" "$combined"
+                ok "Container recriado com novos dispositivos USB."
+            fi
+            ;;
+    esac
+}
+
+do_reset() {
+    require_root
+    confirm "RESET TOTAL: remover TODOS os containers e a rede Docker?" || return
+    [[ -f "$CONTAINERS_CONF" ]] && while IFS='|' read -r name _; do
+        [[ -z "$name" ]] && continue
+        docker stop "$name" 2>/dev/null || true
+        docker rm   "$name" 2>/dev/null || true
+        local svc="${SERVICE_PREFIX}-${name}"
+        systemctl disable "$svc" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${svc}.service"
+    done < "$CONTAINERS_CONF"
+    remove_macvlan
+    rm -f "$CONTAINERS_CONF"
+    systemctl daemon-reload 2>/dev/null || true
+    ok "Reset completo."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MODO NÃO-INTERATIVO
+# ─────────────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --start)  [[ -n "${2:-}" ]] && start_container "$2"; exit 0 ;;
+    --stop)   [[ -n "${2:-}" ]] && stop_container  "$2"; exit 0 ;;
+    --bridge) ensure_host_bridge; exit 0 ;;
+esac
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOOP PRINCIPAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+init_state
+
+while true; do
+    banner
+    menu
+    read -r opt
+
+    case "$opt" in
+        1)  add_new_container ;;
+        2)  do_action start ;;
+        3)  do_action stop ;;
+        4)  do_action restart ;;
+        5)  do_action remove ;;
+        6)  do_action shell ;;
+        7)  do_action logs ;;
+        8)  do_action status ;;
+        9)  list_usb_devices ;;
+        10) do_action usb ;;
+        11) require_root && remove_macvlan && ensure_macvlan && ensure_host_bridge ;;
+        12) do_action ping ;;
+        13) monitor_live ;;
+        14) show_host_resources; show_container_resources ;;
+        15) do_action autostart ;;
+        C|c) catalog_menu ;;
+        U|u) do_action update ;;
+        I|i) install_deps ;;
+        18)  do_reset ;;
+        q|Q) echo -e "${G} Até mais!${RST}"; exit 0 ;;
+        *)   warn "Opção inválida." ;;
+    esac
+
+    [[ "$opt" != "6" && "$opt" != "7" && "$opt" != "13" ]] && pause
+done
