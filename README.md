@@ -62,8 +62,6 @@ O script instala automaticamente as dependências que faltarem ao rodar a opçã
 ## Instalação
 
 ```bash
-# Baixe o script
-wget https://seu-repositorio/container-manager.sh
 
 # Dê permissão de execução
 chmod +x container-manager.sh
