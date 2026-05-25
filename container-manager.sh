@@ -2,8 +2,6 @@
 # =============================================================================
 #  container-manager.sh — Gerenciador Multi-Container para Raspberry Pi
 #  Suporte: qualquer imagem Docker · macvlan · USB Passthrough · Monitor
-#  Autor: Ramon Alcântara
-#  Linkedin: https://www.linkedin.com/in/ramon-ranieri-276566150/
 # =============================================================================
 set -uo pipefail
 
@@ -444,6 +442,7 @@ list_usb_devices() {
 }
 
 select_usb_for_container() {
+    # Todo output interativo vai para stderr para não contaminar a captura via $()
     local usb_list=()
     for d in /dev/ttyUSB* /dev/ttyACM* /dev/cdc-wdm* /dev/net/tun; do
         [[ -e "$d" ]] && usb_list+=("$d")
@@ -453,14 +452,16 @@ select_usb_for_container() {
     done < <(lsblk -ndo NAME,TYPE 2>/dev/null | awk '$2=="disk"{print "/dev/"$1}')
 
     if [[ ${#usb_list[@]} -eq 0 ]]; then
-        warn "Nenhum dispositivo USB encontrado no momento."; echo ""; return
+        echo -e "\n ${Y}⚠${RST}  Nenhum dispositivo USB encontrado no momento." >&2
+        echo ""   # stdout vazio = sem flags
+        return
     fi
 
-    echo -e "\n ${W}Dispositivos disponíveis:${RST}"
+    echo -e "\n ${W}Dispositivos disponíveis:${RST}" >&2
     local i=1
-    for d in "${usb_list[@]}"; do echo -e "  ${C}$i)${RST} $d"; (( i++ )); done
-    echo -e "  ${DIM}0) Nenhum${RST}"
-    echo -n "  Escolha (ex: 1 3): "; read -r choices
+    for d in "${usb_list[@]}"; do echo -e "  ${C}$i)${RST} $d" >&2; (( i++ )); done
+    echo -e "  ${DIM}0) Nenhum${RST}" >&2
+    echo -n "  Escolha (ex: 1 3): " >&2; read -r choices
 
     local flags=""
     for c in $choices; do
@@ -470,6 +471,7 @@ select_usb_for_container() {
             flags+=" --device=${usb_list[$idx]}"
         fi
     done
+    # Só o resultado vai para stdout — capturado limpo pelo $()
     echo "$flags"
 }
 
@@ -544,6 +546,12 @@ create_container_run() {
     local data_dir="$DATA_BASE/$name"
     mkdir -p "$data_dir/data" "$data_dir/tools"
 
+    # Converte usb_flags string para array — evita word-splitting com valores vazios
+    local -a usb_args=()
+    if [[ -n "${usb_flags// /}" ]]; then
+        read -ra usb_args <<< "$usb_flags"
+    fi
+
     docker run -d \
         --name "$name" \
         --network "$MACVLAN_NET" \
@@ -556,7 +564,7 @@ create_container_run() {
         -v "${data_dir}/tools:/opt/tools" \
         -e LANG=pt_BR.UTF-8 \
         --restart=unless-stopped \
-        ${usb_flags} \
+        "${usb_args[@]+"${usb_args[@]}"}" \
         "$image" \
         bash -c '
             export DEBIAN_FRONTEND=noninteractive
@@ -968,7 +976,8 @@ do_action() {
                 local image ip auto usb
                 IFS='|' read -r _ image ip auto usb <<< "$(grep "^${name}|" "$CONTAINERS_CONF")"
                 local new_usb; new_usb=$(select_usb_for_container)
-                local combined="${usb} ${new_usb}"
+                # Limpa espaços duplicados ao combinar flags existentes com novas
+                local combined; combined=$(echo "${usb} ${new_usb}" | tr -s ' ' | sed 's/^ //;s/ $//')
                 stop_container "$name"; docker rm "$name"
                 create_container_run "$name" "$image" "$ip" "$combined"
                 save_container "$name" "$image" "$ip" "$auto" "$combined"
