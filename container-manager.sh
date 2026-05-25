@@ -860,17 +860,36 @@ add_new_container() {
 }
 
 start_container() {
+    # docker start preserva TUDO que estava no container (pacotes, configs, arquivos).
+    # A camada gravável do container é mantida entre stop/start.
     local name=$1; require_docker
-    ensure_macvlan; ensure_host_bridge
-    docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$" \
-        && { warn "'${name}' já está rodando."; return; }
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$" \
-        || { err "Container '${name}' não encontrado."; return; }
+
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        warn "'${name}' já está rodando."; return
+    fi
+    if ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        err "Container '${name}' não existe. Use a opção 1 para criar."; return
+    fi
+
+    local net_mode; net_mode=$(conf_get "$name" 8)
+    [[ "$net_mode" == "macvlan" ]] && { ensure_macvlan; ensure_host_bridge; }
+
     log "Iniciando '${name}'..."
     docker start "$name"
-    local ip; ip=$(get_container_ip "$name")
-    [[ -n "$ip" ]] && ip route add "${ip}/32" dev macvlan0 2>/dev/null || true
-    ok "'${name}' iniciado — IP: ${C}${ip}${RST}"
+    sleep 1
+
+    # Restaura rota no macvlan (bridge restaura sozinho)
+    if [[ "$net_mode" == "macvlan" ]]; then
+        local ip; ip=$(get_container_ip "$name")
+        [[ -n "$ip" ]] && ip route add "${ip}/32" dev macvlan0 2>/dev/null || true
+        ok "'${name}' iniciado — IP: ${C}${ip}${RST}"
+    else
+        local ip; ip=$(conf_get "$name" 3)
+        local ssh_port=$((2200 + $(echo "$ip" | awk -F. '{print $4}')))
+        local host_ip; host_ip=$(ip -4 addr show "$HOST_INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+        ok "'${name}' iniciado."
+        echo -e "  ${DIM}SSH:${RST} ssh root@${host_ip} -p ${ssh_port}"
+    fi
 }
 
 stop_container() {
@@ -880,9 +899,32 @@ stop_container() {
     log "Parando '${name}'..."; docker stop "$name"; ok "'${name}' parado."
 }
 
+container_commit() {
+    # Salva o estado atual do container como uma imagem local antes de remover.
+    # Isso preserva pacotes instalados, configs feitas dentro do container.
+    local name=$1
+    local tag="cm-snapshot/${name}:$(date +%Y%m%d-%H%M%S)"
+    log "Fazendo commit do container '${name}' como '${tag}'..."
+    docker commit "$name" "$tag" 2>/dev/null         && ok "Snapshot salvo: ${tag}"         || warn "Commit falhou — pacotes instalados no container serão perdidos."
+    echo "$tag"
+}
+
 remove_container() {
     local name=$1; require_root; require_docker
-    confirm "Remover container '${name}' permanentemente?" || return
+
+    echo -e "\n ${Y}⚠  ATENÇÃO — O que será perdido ao remover '${name}':${RST}"
+    echo -e "  ${R}•${RST} Pacotes instalados dentro do container (apt-get install, etc)"
+    echo -e "  ${R}•${RST} Arquivos em /root, /etc, /var (exceto o que está em /root/persistent)"
+    echo -e "  ${G}•${RST} Arquivos em /root/persistent e /opt/tools são mantidos (volumes)"
+    echo ""
+    echo -e "  ${W}Dica:${RST} 'Parar' (opção 3) preserva tudo. Só remova se quiser mesmo recriar."
+    echo ""
+
+    confirm "Fazer snapshot (docker commit) antes de remover?"         && container_commit "$name"
+
+    echo ""
+    confirm "Confirma remoção definitiva do container '${name}'?" || return
+
     docker stop "$name" 2>/dev/null || true
     docker rm "$name" 2>/dev/null || true
     remove_container_conf "$name"
@@ -891,7 +933,8 @@ remove_container() {
     rm -f "/etc/systemd/system/${svc}.service"
     systemctl daemon-reload 2>/dev/null || true
     ok "'${name}' removido."
-    confirm "Remover dados persistentes em $DATA_BASE/$name?" && rm -rf "$DATA_BASE/$name" && ok "Dados removidos."
+    echo ""
+    confirm "Remover também os dados persistentes em $DATA_BASE/$name?"         && rm -rf "$DATA_BASE/$name" && ok "Dados removidos."         || info "Dados preservados em $DATA_BASE/$name"
 }
 
 shell_into() {
@@ -919,17 +962,28 @@ update_container_image() {
     fi
 
     ok "Nova versão disponível!"
-    confirm "Recriar o container para usar a nova imagem? (dados persistentes mantidos)" || return
+    echo ""
+    warn "Recriar o container instala a nova imagem mas PERDE pacotes instalados manualmente."
+    echo -e "  ${DIM}Arquivos em /root/persistent e /opt/tools são mantidos (volumes).${RST}"
+    confirm "Continuar com a recriação?" || return
 
-    local ip; ip=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f3)
-    local auto; auto=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f4)
-    local usb; usb=$(grep "^${name}|" "$CONTAINERS_CONF" | cut -d'|' -f5)
+    # Salva snapshot antes de recriar
+    container_commit "$name"
+
+    local ip;       ip=$(conf_get "$name" 3)
+    local auto;     auto=$(conf_get "$name" 4)
+    local usb;      usb=$(conf_get "$name" 5)
+    local internet; internet=$(conf_get "$name" 6)
+    local dns;      dns=$(conf_get "$name" 7)
+    local net_mode; net_mode=$(conf_get "$name" 8)
+    local ports;    ports=$(conf_get "$name" 9)
 
     stop_container "$name"
     docker rm "$name"
 
-    if create_container_run "$name" "$image" "$ip" "$usb"; then
+    if create_container_run "$name" "$image" "$ip" "$usb" "$internet" "$dns" "$net_mode" "$ports"; then
         ok "Container '${name}' recriado com imagem atualizada."
+        info "Para restaurar pacotes: docker run -it cm-snapshot/${name}:<tag> bash"
     else
         err "Falha ao recriar. Dados em $DATA_BASE/$name estão intactos."
     fi
@@ -1172,18 +1226,30 @@ net_fix_route() {
     detect_and_apply_masquerade "$LAN_SUBNET" "$HOST_INTERFACE"
 
     # ── Passo 3: Rota default no namespace de rede do container ──────────────
-    local ok_route=false
-    if command -v ip &>/dev/null; then
-        mkdir -p /var/run/netns 2>/dev/null
-        ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/_cm_${name}" 2>/dev/null
-        ip netns exec "_cm_${name}" ip route del default 2>/dev/null || true
-        ip netns exec "_cm_${name}" ip route add default via "$gw" 2>/dev/null \
-            && ok_route=true
-        rm -f "/var/run/netns/_cm_${name}" 2>/dev/null
+    # Localiza o binário 'ip' no host (PATH do sudo pode estar incompleto)
+    local ip_bin=""
+    for _p in /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip /usr/local/sbin/ip; do
+        [[ -x "$_p" ]] && { ip_bin="$_p"; break; }
+    done
+    command -v ip &>/dev/null && [[ -z "$ip_bin" ]] && ip_bin="$(command -v ip)"
+
+    if [[ -z "$ip_bin" ]]; then
+        err "'ip' não encontrado no host. Instale com: apt-get install iproute2"; return 1
     fi
+    info "Usando binário: ${ip_bin}"
+
+    local ok_route=false
+    mkdir -p /var/run/netns 2>/dev/null
+    ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/_cm_${name}" 2>/dev/null
+    "$ip_bin" netns exec "_cm_${name}" "$ip_bin" route del default 2>/dev/null || true
+    "$ip_bin" netns exec "_cm_${name}" "$ip_bin" route add default via "$gw" 2>/dev/null \
+        && ok_route=true
+    rm -f "/var/run/netns/_cm_${name}" 2>/dev/null
 
     if [[ "$ok_route" == false ]]; then
-        err "Falha ao adicionar rota. 'ip' instalado no host?"; return 1
+        err "Falha ao adicionar rota via ip netns."
+        info "Verifique: ls -la /sbin/ip /usr/sbin/ip"
+        return 1
     fi
     ok "Rota default -> ${gw} configurada."
 
@@ -1205,17 +1271,17 @@ net_fix_route() {
     ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/_cmtest_${name}" 2>/dev/null
 
     # Ping gateway
-    if ip netns exec "_cmtest_${name}" ping -c2 -W2 "$gw" &>/dev/null 2>/dev/null; then
+    if "$ip_bin" netns exec "_cmtest_${name}" ping -c2 -W2 "$gw" &>/dev/null 2>/dev/null; then
         ok "Gateway ${gw} acessível."
     else
         warn "Gateway ${gw} sem resposta."
         info "Rotas no namespace do container:"
-        ip netns exec "_cmtest_${name}" ip route 2>/dev/null \
+        "$ip_bin" netns exec "_cmtest_${name}" "$ip_bin" route 2>/dev/null \
             | while read -r l; do echo -e "    ${DIM}${l}${RST}"; done
     fi
 
     # Ping internet
-    if ip netns exec "_cmtest_${name}" ping -c2 -W3 8.8.8.8 &>/dev/null 2>/dev/null; then
+    if "$ip_bin" netns exec "_cmtest_${name}" ping -c2 -W3 8.8.8.8 &>/dev/null 2>/dev/null; then
         ok "Internet funcionando! (8.8.8.8 alcançável)"
     else
         warn "8.8.8.8 inacessível."
@@ -1597,6 +1663,7 @@ menu() {
     echo -e "  ${G}1${RST}) Adicionar novo container"
     echo -e "  ${C}2${RST}) Iniciar   ${R}3${RST}) Parar   ${Y}4${RST}) Reiniciar   ${B}5${RST}) Remover"
     echo -e "  ${C}6${RST}) Shell     ${C}7${RST}) Logs    ${B}8${RST}) Status detalhado"
+    echo -e "  ${P}K${RST}) Snapshot (salvar estado do container como imagem)"
     echo ""
     echo -e " ${W}Catálogo de Imagens${RST}"
     echo -e "  ${P}C${RST}) Gerenciar catálogo (adicionar · editar · pull · atualizar)"
@@ -1727,6 +1794,10 @@ while true; do
         4)  do_action restart ;;
         5)  do_action remove ;;
         6)  do_action shell ;;
+        K|k) select_container "Snapshot de qual container?" \
+                && container_commit "$SELECTED_CONTAINER" \
+                && docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}" \
+                   | grep "cm-snapshot/${SELECTED_CONTAINER}" ;;
         7)  do_action logs ;;
         8)  do_action status ;;
         9)  list_usb_devices ;;
