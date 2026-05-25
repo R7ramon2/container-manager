@@ -570,6 +570,7 @@ create_container_run() {
     # Sem internet: adiciona --network=none depois de criar, via pós-configuração
     # (macvlan não suporta --network=none direto; bloqueio é feito via iptables dentro do container)
 
+    # Passa gateway e política para dentro do container via env
     docker run -d \
         --name "$name" \
         --network "$MACVLAN_NET" \
@@ -582,43 +583,64 @@ create_container_run() {
         -v "${data_dir}/tools:/opt/tools" \
         -e LANG=pt_BR.UTF-8 \
         -e CONTAINER_INTERNET="$internet" \
+        -e CONTAINER_GW="$LAN_GATEWAY" \
         --restart=unless-stopped \
         "${usb_args[@]+"${usb_args[@]}"}" \
         "${net_args[@]+"${net_args[@]}"}" \
         "$image" \
         bash -c '
             export DEBIAN_FRONTEND=noninteractive
-            if   command -v apt-get >/dev/null 2>&1; then
+
+            # ── 1. Instala pacotes essenciais ──────────────────────────────
+            if command -v apt-get >/dev/null 2>&1; then
                 apt-get update -qq 2>/dev/null
-                apt-get install -y -qq openssh-server iproute2 curl wget net-tools 2>/dev/null || true
+                apt-get install -y -qq \
+                    openssh-server iproute2 iputils-ping \
+                    curl wget net-tools iptables 2>/dev/null || true
             elif command -v apk >/dev/null 2>&1; then
-                apk add --no-cache openssh iproute2 curl wget 2>/dev/null || true
+                apk add --no-cache openssh iproute2 iputils curl wget iptables 2>/dev/null || true
                 ssh-keygen -A 2>/dev/null || true
             elif command -v dnf >/dev/null 2>&1; then
-                dnf install -y openssh-server iproute curl wget 2>/dev/null || true
+                dnf install -y openssh-server iproute iputils curl wget iptables 2>/dev/null || true
             elif command -v pacman >/dev/null 2>&1; then
-                pacman -Sy --noconfirm openssh iproute2 curl wget 2>/dev/null || true
+                pacman -Sy --noconfirm openssh iproute2 iputils curl wget iptables 2>/dev/null || true
             elif command -v zypper >/dev/null 2>&1; then
-                zypper -n install openssh iproute2 curl wget 2>/dev/null || true
+                zypper -n install openssh iproute2 iputils curl wget iptables 2>/dev/null || true
             fi
+
+            # ── 2. Configura SSH ───────────────────────────────────────────
             mkdir -p /run/sshd /var/run/sshd
             echo "root:raspberry" | chpasswd 2>/dev/null || true
             sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true
-            sed -i "s/PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true
+            sed -i "s/PermitRootLogin.*/PermitRootLogin yes/"  /etc/ssh/sshd_config 2>/dev/null || true
             (which /usr/sbin/sshd && /usr/sbin/sshd) 2>/dev/null \
                 || (which sshd && sshd) 2>/dev/null || true
-            # Configura internet conforme flag
-            if [[ "$CONTAINER_INTERNET" == "no" ]]; then
-                # Bloqueia saída para internet mantendo LAN acessível
-                iptables -F OUTPUT 2>/dev/null || true
-                # Permite loopback e LAN local
-                iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-                iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
-                iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
-                iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
-                # Bloqueia todo o resto (internet)
-                iptables -A OUTPUT -j DROP 2>/dev/null || true
-            fi
+
+            # ── 3. Configura rota default (macvlan não injeta rota) ────────
+            # O Docker com macvlan não adiciona rota default automaticamente.
+            # Precisamos configurar explicitamente via gateway da LAN.
+            GW="${CONTAINER_GW:-192.168.1.1}"
+            ip route del default 2>/dev/null || true
+            ip route add default via "$GW" 2>/dev/null || true
+
+            # ── 4. Aplica política de internet ─────────────────────────────
+            case "$CONTAINER_INTERNET" in
+                lan-only)
+                    iptables -F OUTPUT 2>/dev/null || true
+                    iptables -A OUTPUT -o lo            -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -d 10.0.0.0/8    -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -j DROP 2>/dev/null || true
+                    ;;
+                none)
+                    iptables -F OUTPUT 2>/dev/null || true
+                    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -j DROP 2>/dev/null || true
+                    ;;
+                # yes ou qualquer outro: internet livre, nada a bloquear
+            esac
+
             tail -f /dev/null
         ' 2>&1
 }
@@ -932,7 +954,22 @@ net_diag() {
     docker exec "$name" cat /etc/resolv.conf 2>/dev/null         | grep -v '^#' | grep -v '^$'         | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
 
     echo -e "\n  ${DIM}Rotas no container:${RST}"
-    docker exec "$name" ip route 2>/dev/null         | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
+    local routes
+    routes=$(docker exec "$name" bash -c \
+        'command -v ip >/dev/null 2>&1 && ip route || command -v route >/dev/null 2>&1 && route -n || echo "(iproute2 não instalado — use opção 7 para instalar e corrigir)"' \
+        2>/dev/null)
+    echo "$routes" | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
+
+    # Mostra diagnóstico rápido de causa provável
+    echo -e "\n  ${DIM}Causa provável:${RST}"
+    if ! docker exec "$name" bash -c 'command -v ip >/dev/null 2>&1' 2>/dev/null; then
+        echo -e "    ${Y}⚠  iproute2 não encontrado — use opção 7 para instalar e corrigir rota${RST}"
+    elif ! docker exec "$name" ping -c1 -W1 "$LAN_GATEWAY" &>/dev/null 2>&1; then
+        echo -e "    ${Y}⚠  Gateway inacessível — rota default provavelmente ausente${RST}"
+        echo -e "    ${DIM}   Use a opção 7 (corrigir rota default) para resolver${RST}"
+    else
+        echo -e "    ${G}✔  Sem problemas óbvios detectados${RST}"
+    fi
 }
 
 net_fix_dns() {
@@ -953,12 +990,49 @@ net_fix_dns() {
 
 net_fix_route() {
     # Garante que a rota default aponta para o gateway
+    # Tenta ip(iproute2) primeiro, cai para route(net-tools) se não tiver
     local name=$1
     log "Corrigindo rota default em '${name}'..."
+
+    # Primeiro garante que iproute2 está instalado
     docker exec "$name" bash -c "
-        ip route del default 2>/dev/null || true
-        ip route add default via $LAN_GATEWAY 2>/dev/null
-    " 2>/dev/null         && ok "Rota default -> ${LAN_GATEWAY} configurada em '${name}'."         || err "Falha ao configurar rota."
+        command -v ip >/dev/null 2>&1 || {
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get install -y -qq iproute2 iputils-ping iptables 2>/dev/null || true
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache iproute2 iputils iptables 2>/dev/null || true
+            fi
+        }
+    " 2>/dev/null
+
+    docker exec "$name" bash -c "
+        GW='$LAN_GATEWAY'
+        if command -v ip >/dev/null 2>&1; then
+            ip route del default 2>/dev/null || true
+            ip route add default via \"\$GW\" && echo 'rota_ok' || echo 'rota_fail'
+        elif command -v route >/dev/null 2>&1; then
+            route del default 2>/dev/null || true
+            route add default gw \"\$GW\" && echo 'rota_ok' || echo 'rota_fail'
+        else
+            echo 'sem_ferramenta'
+        fi
+    " 2>/dev/null | grep -q 'rota_ok' \
+        && ok "Rota default -> ${LAN_GATEWAY} configurada em '${name}'." \
+        || {
+            local reason
+            reason=$(docker exec "$name" bash -c "
+                command -v ip >/dev/null 2>&1 && echo 'ip_presente' || echo 'ip_ausente'
+            " 2>/dev/null)
+            if [[ "$reason" == "ip_ausente" ]]; then
+                err "iproute2 não instalado. Tentando instalar e refazer..."
+                docker exec "$name" bash -c "apt-get install -y -qq iproute2 2>/dev/null || apk add iproute2 2>/dev/null || true" 2>/dev/null
+                docker exec "$name" bash -c "ip route del default 2>/dev/null; ip route add default via $LAN_GATEWAY" 2>/dev/null \
+                    && ok "Rota configurada após instalar iproute2." \
+                    || err "Falha mesmo após instalar iproute2."
+            else
+                err "Falha ao configurar rota. Verifique se o container tem NET_ADMIN."
+            fi
+        }
 }
 
 net_config_menu() {
