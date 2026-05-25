@@ -516,20 +516,15 @@ ensure_host_bridge() {
         ok "IP forwarding habilitado (persistente)."
     fi
 
-    # ── Masquerade NAT ────────────────────────────────────────────────────────
-    # Traduz o IP do container para o IP do Raspberry Pi antes de sair para o
-    # roteador. Necessário porque roteadores domésticos não têm rota estática
-    # para os IPs dos containers.
-    if ! iptables -t nat -C POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null; then
-        iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE
-        ok "Masquerade NAT ativado (${LAN_SUBNET} saindo por ${HOST_INTERFACE})."
+    # ── IP forwarding ─────────────────────────────────────────────────────────
+    if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null \
+            && sed -i "s/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/" /etc/sysctl.conf \
+            || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+        ok "IP forwarding habilitado."
     fi
-
-    # Libera encaminhamento entre as interfaces
-    iptables -C FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT 2>/dev/null \
-        || iptables -A FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT
-    iptables -C FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT 2>/dev/null \
-        || iptables -A FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT
+    # Masquerade e FORWARD são aplicados por net_fix_route ao iniciar cada container
 }
 
 remove_macvlan() {
@@ -1037,8 +1032,6 @@ net_fix_dns() {
 }
 
 net_fix_route() {
-    # Configura rota default no container usando EXCLUSIVAMENTE ferramentas do HOST.
-    # Não depende de nenhum binário dentro do container.
     local name=$1
     local gw="$LAN_GATEWAY"
     log "Corrigindo rota default em '${name}' via ${gw}..."
@@ -1049,20 +1042,73 @@ net_fix_route() {
         err "Container não está rodando."; return 1
     fi
 
-    # Garante que o host tem ip forwarding + masquerade antes de qualquer coisa
+    # ── Passo 1: IP forwarding ────────────────────────────────────────────────
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-    iptables -t nat -C POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null \
-        || iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null || true
-    # Garante FORWARD aberto (policy pode estar DROP)
-    iptables -P FORWARD ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT 2>/dev/null \
-        || iptables -A FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT 2>/dev/null || true
-    iptables -C FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT 2>/dev/null \
-        || iptables -A FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT 2>/dev/null || true
+    grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null \
+        && sed -i "s/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/" /etc/sysctl.conf \
+        || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-    # ── Método principal: ip netns exec via symlink em /proc ─────────────────
-    # Usa o binário 'ip' do HOST dentro do namespace de rede do container.
-    # Sem tocar no filesystem do container.
+    # ── Passo 2: NAT/Masquerade — detecta backend iptables vs nftables ────────
+    detect_and_apply_masquerade() {
+        local subnet="$1" iface="$2"
+
+        # Descobre qual backend o sistema usa de verdade
+        local backend="iptables-legacy"
+        if command -v nft &>/dev/null; then
+            # Verifica se nftables está ativo como backend principal
+            if nft list tables 2>/dev/null | grep -q "inet\|ip"; then
+                backend="nftables"
+            elif iptables --version 2>/dev/null | grep -q "nf_tables"; then
+                backend="iptables-nft"
+            fi
+        elif command -v iptables-legacy &>/dev/null; then
+            backend="iptables-legacy"
+        fi
+
+        info "Backend de firewall detectado: ${backend}"
+
+        case "$backend" in
+            nftables)
+                # Cria tabela e regra de masquerade via nft
+                nft add table ip cm_nat 2>/dev/null || true
+                nft add chain ip cm_nat postrouting \
+                    '{ type nat hook postrouting priority 100 ; }' 2>/dev/null || true
+                # Remove regra anterior se existir
+                nft flush chain ip cm_nat postrouting 2>/dev/null || true
+                nft add rule ip cm_nat postrouting \
+                    ip saddr "$subnet" oifname "$iface" masquerade 2>/dev/null \
+                    && ok "Masquerade aplicado via nft." \
+                    || err "Falha no nft masquerade."
+                # FORWARD via nft
+                nft add table ip cm_filter 2>/dev/null || true
+                nft add chain ip cm_filter forward \
+                    '{ type filter hook forward priority 0 ; policy accept ; }' 2>/dev/null || true
+                ;;
+            iptables-nft)
+                # Usa iptables-nft explicitamente
+                iptables-nft -t nat -C POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE 2>/dev/null \
+                    || iptables-nft -t nat -A POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE
+                iptables-nft -P FORWARD ACCEPT 2>/dev/null || true
+                ok "Masquerade aplicado via iptables-nft."
+                ;;
+            iptables-legacy)
+                iptables-legacy -t nat -C POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE 2>/dev/null \
+                    || iptables-legacy -t nat -A POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE
+                iptables-legacy -P FORWARD ACCEPT 2>/dev/null || true
+                ok "Masquerade aplicado via iptables-legacy."
+                ;;
+            *)
+                # Tenta qualquer iptables disponível
+                iptables -t nat -C POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE 2>/dev/null \
+                    || iptables -t nat -A POSTROUTING -s "$subnet" -o "$iface" -j MASQUERADE \
+                    || true
+                ;;
+        esac
+    }
+
+    detect_and_apply_masquerade "$LAN_SUBNET" "$HOST_INTERFACE"
+
+    # ── Passo 3: Rota default no namespace de rede do container ──────────────
     local ok_route=false
     if command -v ip &>/dev/null; then
         mkdir -p /var/run/netns 2>/dev/null
@@ -1073,69 +1119,67 @@ net_fix_route() {
         rm -f "/var/run/netns/_cm_${name}" 2>/dev/null
     fi
 
-    if [[ "$ok_route" == true ]]; then
-        ok "Rota default -> ${gw} configurada no namespace de rede."
-    else
-        err "Não foi possível configurar rota. Verifique se 'ip' está instalado no host."
-        return 1
+    if [[ "$ok_route" == false ]]; then
+        err "Falha ao adicionar rota. 'ip' instalado no host?"; return 1
     fi
+    ok "Rota default -> ${gw} configurada."
 
-    # ── Instala ferramentas dentro do container agora que há rota ─────────────
-    # Agora que a rota está no namespace, o docker exec consegue acessar a rede.
+    # ── Passo 4: Instala ferramentas no container (agora com rota) ────────────
     log "Instalando ferramentas de rede no container..."
     docker exec "$name" bash -c '
         export DEBIAN_FRONTEND=noninteractive
-        PM=""
-        command -v apt-get >/dev/null 2>&1 && PM="apt"
-        command -v apk     >/dev/null 2>&1 && PM="apk"
-        command -v dnf     >/dev/null 2>&1 && PM="dnf"
-        command -v pacman  >/dev/null 2>&1 && PM="pacman"
-        case "$PM" in
-            apt)    apt-get update -qq 2>/dev/null
-                    apt-get install -y -qq iproute2 iputils-ping curl wget iptables 2>/dev/null ;;
-            apk)    apk add --no-cache iproute2 iputils curl wget iptables 2>/dev/null ;;
-            dnf)    dnf install -y -q iproute iputils curl wget iptables 2>/dev/null ;;
-            pacman) pacman -Sy --noconfirm iproute2 iputils curl wget iptables 2>/dev/null ;;
-        esac
-    ' 2>/dev/null && info "Ferramentas instaladas no container." || true
+        command -v apt-get >/dev/null 2>&1 && \
+            apt-get update -qq 2>/dev/null && \
+            apt-get install -y -qq iproute2 iputils-ping curl wget iptables 2>/dev/null || true
+        command -v apk >/dev/null 2>&1 && \
+            apk add --no-cache iproute2 iputils curl wget iptables 2>/dev/null || true
+    ' 2>/dev/null && info "Ferramentas instaladas." || true
 
-    # ── Teste de conectividade real ────────────────────────────────────────────
+    # ── Passo 5: Teste real de conectividade via namespace ────────────────────
     echo ""
-    info "Testando conectividade do container..."
+    info "Testando conectividade..."
+    mkdir -p /var/run/netns 2>/dev/null
+    ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/_cmtest_${name}" 2>/dev/null
 
-    # Testa ping ao gateway via namespace do host (sem precisar do ping no container)
-    if ip netns exec "_cm_${name}_test" ping -c1 -W2 "$gw" &>/dev/null 2>/dev/null \
-       || docker exec "$name" ping -c1 -W2 "$gw" &>/dev/null 2>&1; then
+    # Ping gateway
+    if ip netns exec "_cmtest_${name}" ping -c2 -W2 "$gw" &>/dev/null 2>/dev/null; then
         ok "Gateway ${gw} acessível."
     else
-        # Testa via namespace mesmo sem o symlink (o symlink foi removido)
-        mkdir -p /var/run/netns 2>/dev/null
-        ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/_cm2_${name}" 2>/dev/null
-        if ip netns exec "_cm2_${name}" ping -c1 -W2 "$gw" &>/dev/null 2>/dev/null; then
-            ok "Gateway ${gw} acessível (verificado pelo host)."
-        else
-            warn "Gateway ainda inacessível. Verificando regras do host..."
-            local fwd; fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
-            echo -e "  ip_forward = ${fwd}"
-            iptables -t nat -L POSTROUTING -n 2>/dev/null | grep -E "MASQUERADE|SNAT" \
-                | while read -r l; do echo -e "  NAT: ${DIM}${l}${RST}"; done
-            iptables -L FORWARD -n 2>/dev/null | head -8 \
-                | while read -r l; do echo -e "  FWD: ${DIM}${l}${RST}"; done
-        fi
-        rm -f "/var/run/netns/_cm2_${name}" 2>/dev/null
+        warn "Gateway ${gw} sem resposta."
+        info "Rotas no namespace do container:"
+        ip netns exec "_cmtest_${name}" ip route 2>/dev/null \
+            | while read -r l; do echo -e "    ${DIM}${l}${RST}"; done
     fi
 
-    # Testa internet (ping ao DNS do Google via namespace do host)
-    mkdir -p /var/run/netns 2>/dev/null
-    ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/_cm3_${name}" 2>/dev/null
-    if ip netns exec "_cm3_${name}" ping -c1 -W3 8.8.8.8 &>/dev/null 2>/dev/null; then
+    # Ping internet
+    if ip netns exec "_cmtest_${name}" ping -c2 -W3 8.8.8.8 &>/dev/null 2>/dev/null; then
         ok "Internet funcionando! (8.8.8.8 alcançável)"
     else
-        warn "8.8.8.8 ainda inacessível do container."
-        info "Se o gateway responde mas a internet não, o problema é no masquerade/NAT do host."
-        info "Verifique: iptables -t nat -L POSTROUTING -n -v"
+        warn "8.8.8.8 inacessível."
+
+        # Diagnóstico do masquerade real
+        echo ""
+        info "Estado atual do NAT no host:"
+        if command -v nft &>/dev/null && nft list table ip cm_nat 2>/dev/null | grep -q masquerade; then
+            nft list table ip cm_nat 2>/dev/null | while read -r l; do echo -e "    ${DIM}${l}${RST}"; done
+        else
+            # Tenta todos os backends
+            for ipt in iptables iptables-nft iptables-legacy; do
+                command -v "$ipt" &>/dev/null || continue
+                local rules; rules=$("$ipt" -t nat -L POSTROUTING -n -v 2>/dev/null)
+                if echo "$rules" | grep -q "MASQUERADE\|SNAT"; then
+                    echo -e "  ${DIM}(via ${ipt})${RST}"
+                    echo "$rules" | grep -E "MASQUERADE|SNAT|pkts" \
+                        | while read -r l; do echo -e "    ${DIM}${l}${RST}"; done
+                    break
+                fi
+            done
+            echo -e "  ${Y}Nenhum masquerade ativo encontrado em nenhum backend.${RST}"
+            info "Tente: sudo nft add rule ip cm_nat postrouting ip saddr $LAN_SUBNET oifname $HOST_INTERFACE masquerade"
+        fi
     fi
-    rm -f "/var/run/netns/_cm3_${name}" 2>/dev/null
+
+    rm -f "/var/run/netns/_cmtest_${name}" 2>/dev/null
 }
 
 net_fix_ssh() {
@@ -1213,55 +1257,30 @@ net_fix_ssh() {
 }
 
 net_fix_host_routing() {
-    # Aplica/corrige forwarding + masquerade no HOST (Raspberry Pi).
-    # Pode ser chamada manualmente quando containers existentes perdem internet.
     require_root
+    echo -e "\n ${W}━━ Corrigindo Roteamento do Host + Containers ━━━━━━━━━━━━━━${RST}"
 
-    echo -e "\n ${W}━━ Configuração de Roteamento do Host ━━━━━━━━━━━━━━━━━━━━━━${RST}"
-
-    # IP forwarding
-    local fwd; fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
-    if [[ "$fwd" == "1" ]]; then
-        ok "IP forwarding já habilitado."
-    else
-        echo 1 > /proc/sys/net/ipv4/ip_forward
-        grep -q 'net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null             && sed -i 's/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf             || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
-        ok "IP forwarding habilitado e persistido em /etc/sysctl.conf."
-    fi
-
-    # Masquerade
-    if iptables -t nat -C POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null; then
-        ok "Masquerade já configurado."
-    else
-        iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE
-        ok "Masquerade NAT adicionado (${LAN_SUBNET} → ${HOST_INTERFACE})."
-    fi
-
-    # FORWARD rules
-    iptables -C FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT 2>/dev/null         || { iptables -A FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT
-             ok "Regra FORWARD entrada adicionada."; }
-    iptables -C FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT 2>/dev/null         || { iptables -A FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT
-             ok "Regra FORWARD saída adicionada."; }
-
-    # Mostra estado atual
-    echo -e "\n  ${DIM}Estado atual do NAT:${RST}"
-    iptables -t nat -L POSTROUTING -n --line-numbers 2>/dev/null         | grep -E "MASQUERADE|Chain"         | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
-
-    echo -e "\n  ${DIM}Estado do forwarding:${RST}"
-    echo -e "    ${DIM}ip_forward = $(cat /proc/sys/net/ipv4/ip_forward)${RST}"
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+    grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null \
+        && sed -i "s/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/" /etc/sysctl.conf \
+        || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+    ok "IP forwarding = $(cat /proc/sys/net/ipv4/ip_forward)"
 
     echo ""
-    # Agora corrige a rota dentro de cada container running
+    info "Aplicando masquerade e corrigindo rota em cada container..."
     local fixed=0
     while IFS='|' read -r name _ _ _ _ inet _; do
         [[ -z "$name" || "$inet" == "none" ]] && continue
         if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
-            log "Corrigindo rota em '${name}'..."
+            echo ""
+            log "Container: ${name}"
             net_fix_route "$name"
             (( fixed++ ))
         fi
     done < "$CONTAINERS_CONF"
-    [[ $fixed -gt 0 ]] && ok "${fixed} container(s) com rota corrigida."                        || info "Nenhum container rodando para corrigir."
+    echo ""
+    [[ $fixed -gt 0 ]] && ok "${fixed} container(s) processado(s)." \
+                       || info "Nenhum container rodando no momento."
 }
 
 net_config_menu() {
