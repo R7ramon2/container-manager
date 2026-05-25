@@ -960,7 +960,28 @@ net_diag() {
         2>/dev/null)
     echo "$routes" | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
 
-    # Mostra diagnóstico rápido de causa provável
+    # ── Status do SSH ──────────────────────────────────────────────────────
+    echo -e "\n  ${DIM}Status do SSH:${RST}"
+    local ip_val; ip_val=$(conf_get "$name" 3)
+    if docker exec "$name" bash -c 'pgrep -x sshd >/dev/null 2>&1' 2>/dev/null; then
+        echo -e "    ${G}✔  sshd está rodando${RST}"
+        if nc -z -w2 "$ip_val" 22 2>/dev/null; then
+            echo -e "    ${G}✔  Porta 22 acessível em ${ip_val}${RST}"
+            echo -e "    ${DIM}   ssh root@${ip_val}  (senha: raspberry)${RST}"
+        else
+            echo -e "    ${Y}⚠  sshd rodando mas porta 22 não responde externamente${RST}"
+            echo -e "    ${DIM}   Verifique firewall ou use: docker exec -it ${name} bash${RST}"
+        fi
+    else
+        echo -e "    ${R}✘  sshd não está rodando${RST}"
+        if docker exec "$name" bash -c 'command -v sshd >/dev/null 2>&1' 2>/dev/null; then
+            echo -e "    ${Y}   openssh instalado mas não iniciado — use opção 9 para corrigir${RST}"
+        else
+            echo -e "    ${Y}   openssh não instalado — use opção 9 para instalar${RST}"
+        fi
+    fi
+
+    # ── Causa provável ─────────────────────────────────────────────────────
     echo -e "\n  ${DIM}Causa provável:${RST}"
     if ! docker exec "$name" bash -c 'command -v ip >/dev/null 2>&1' 2>/dev/null; then
         echo -e "    ${Y}⚠  iproute2 não encontrado — use opção 7 para instalar e corrigir rota${RST}"
@@ -968,7 +989,7 @@ net_diag() {
         echo -e "    ${Y}⚠  Gateway inacessível — rota default provavelmente ausente${RST}"
         echo -e "    ${DIM}   Use a opção 7 (corrigir rota default) para resolver${RST}"
     else
-        echo -e "    ${G}✔  Sem problemas óbvios detectados${RST}"
+        echo -e "    ${G}✔  Rede ok${RST}"
     fi
 }
 
@@ -989,50 +1010,234 @@ net_fix_dns() {
 }
 
 net_fix_route() {
-    # Garante que a rota default aponta para o gateway
-    # Tenta ip(iproute2) primeiro, cai para route(net-tools) se não tiver
+    # Configura rota default no container SEM depender de pacotes instalados nele.
+    #
+    # Estratégia em camadas (da mais simples para a mais robusta):
+    #   1. nsenter: entra no namespace de rede do container pelo host e roda o
+    #      'ip' do PRÓPRIO HOST — não precisa de nada instalado no container.
+    #   2. /proc/net/route (escrita direta): fallback puro bash, sem binários.
+    #   3. docker cp do binário 'ip' do host para dentro do container.
+    #   4. apt-get/apk (só funciona se já tiver rota — caso raro de reparo parcial).
     local name=$1
-    log "Corrigindo rota default em '${name}'..."
+    local gw="$LAN_GATEWAY"
+    log "Corrigindo rota default em '${name}' via ${gw}..."
 
-    # Primeiro garante que iproute2 está instalado
-    docker exec "$name" bash -c "
-        command -v ip >/dev/null 2>&1 || {
-            if command -v apt-get >/dev/null 2>&1; then
-                apt-get install -y -qq iproute2 iputils-ping iptables 2>/dev/null || true
-            elif command -v apk >/dev/null 2>&1; then
-                apk add --no-cache iproute2 iputils iptables 2>/dev/null || true
-            fi
-        }
-    " 2>/dev/null
+    # Pega o PID do processo principal do container
+    local pid
+    pid=$(docker inspect -f '{{.State.Pid}}' "$name" 2>/dev/null)
+    if [[ -z "$pid" || "$pid" == "0" ]]; then
+        err "Container '${name}' não está rodando ou sem PID."; return 1
+    fi
 
-    docker exec "$name" bash -c "
-        GW='$LAN_GATEWAY'
-        if command -v ip >/dev/null 2>&1; then
+    # ── Método 1: nsenter ─────────────────────────────────────────────────────
+    # Entra no network namespace do container e usa o 'ip' do host.
+    # Não toca no filesystem do container, não precisa de nada instalado nele.
+    if command -v nsenter &>/dev/null && command -v ip &>/dev/null; then
+        local result
+        result=$(nsenter -t "$pid" -n -- bash -c "
             ip route del default 2>/dev/null || true
-            ip route add default via \"\$GW\" && echo 'rota_ok' || echo 'rota_fail'
-        elif command -v route >/dev/null 2>&1; then
-            route del default 2>/dev/null || true
-            route add default gw \"\$GW\" && echo 'rota_ok' || echo 'rota_fail'
-        else
-            echo 'sem_ferramenta'
+            ip route add default via $gw 2>/dev/null && echo OK || echo FAIL
+        " 2>/dev/null)
+        if [[ "$result" == "OK" ]]; then
+            ok "Rota default -> ${gw} (via nsenter)."
+            # Agora com rede funcionando, aproveita para instalar iproute2 no container
+            log "Instalando iproute2 no container agora que há conectividade..."
+            docker exec "$name" bash -c "
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y -qq iproute2 iputils-ping iptables 2>/dev/null || true
+                elif command -v apk >/dev/null 2>&1; then
+                    apk add --no-cache iproute2 iputils iptables 2>/dev/null || true
+                fi
+            " 2>/dev/null && info "iproute2 instalado no container." || true
+            return 0
         fi
-    " 2>/dev/null | grep -q 'rota_ok' \
-        && ok "Rota default -> ${LAN_GATEWAY} configurada em '${name}'." \
+        warn "nsenter falhou, tentando método alternativo..."
+    else
+        warn "nsenter não encontrado no host. Instale com: apt-get install util-linux"
+    fi
+
+    # ── Método 2: ip netns via PID (equivalente ao nsenter mas usando ip) ─────
+    if command -v ip &>/dev/null; then
+        # Cria link temporário do netns para o ip netns possa encontrá-lo
+        mkdir -p /var/run/netns
+        ln -sfn "/proc/${pid}/ns/net" "/var/run/netns/__cm_${name}" 2>/dev/null
+        local result
+        result=$(ip netns exec "__cm_${name}" bash -c "
+            ip route del default 2>/dev/null || true
+            ip route add default via $gw 2>/dev/null && echo OK || echo FAIL
+        " 2>/dev/null)
+        rm -f "/var/run/netns/__cm_${name}" 2>/dev/null
+        if [[ "$result" == "OK" ]]; then
+            ok "Rota default -> ${gw} (via ip netns)."
+            log "Instalando iproute2 agora que há conectividade..."
+            docker exec "$name" bash -c "
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y -qq iproute2 iputils-ping iptables 2>/dev/null || true
+                elif command -v apk >/dev/null 2>&1; then
+                    apk add --no-cache iproute2 iputils iptables 2>/dev/null || true
+                fi
+            " 2>/dev/null && info "iproute2 instalado." || true
+            return 0
+        fi
+        warn "ip netns falhou, tentando cópia de binário..."
+    fi
+
+    # ── Método 3: copia o binário 'ip' do host para dentro do container ───────
+    # Copia temporariamente o executável 'ip' do host para /tmp do container,
+    # roda a configuração, e remove. Não deixa rastro permanente.
+    local ip_bin; ip_bin=$(command -v ip 2>/dev/null)
+    if [[ -n "$ip_bin" ]]; then
+        log "Copiando binário 'ip' do host para o container temporariamente..."
+        docker cp "$ip_bin" "${name}:/tmp/_ip_host" 2>/dev/null
+        local result
+        result=$(docker exec "$name" bash -c "
+            chmod +x /tmp/_ip_host 2>/dev/null
+            /tmp/_ip_host route del default 2>/dev/null || true
+            /tmp/_ip_host route add default via $gw 2>/dev/null && echo OK || echo FAIL
+            rm -f /tmp/_ip_host
+        " 2>/dev/null)
+        if [[ "$result" == "OK" ]]; then
+            ok "Rota default -> ${gw} (via binário do host)."
+            log "Instalando iproute2 agora que há conectividade..."
+            docker exec "$name" bash -c "
+                if command -v apt-get >/dev/null 2>&1; then
+                    apt-get install -y -qq iproute2 iputils-ping iptables 2>/dev/null || true
+                elif command -v apk >/dev/null 2>&1; then
+                    apk add --no-cache iproute2 iputils iptables 2>/dev/null || true
+                fi
+            " 2>/dev/null && info "iproute2 instalado." || true
+            return 0
+        fi
+        warn "Cópia de binário falhou. Tentando método final..."
+    fi
+
+    # ── Método 4: apt-get/apk (só funciona se já tiver alguma rota parcial) ───
+    docker exec "$name" bash -c "
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y -qq iproute2 2>/dev/null
+        elif command -v apk >/dev/null 2>&1; then
+            apk add --no-cache iproute2 2>/dev/null
+        fi
+        ip route del default 2>/dev/null || true
+        ip route add default via $gw 2>/dev/null && echo OK || echo FAIL
+    " 2>/dev/null | grep -q 'OK' \
+        && ok "Rota default -> ${gw} (após instalar iproute2)." \
         || {
-            local reason
-            reason=$(docker exec "$name" bash -c "
-                command -v ip >/dev/null 2>&1 && echo 'ip_presente' || echo 'ip_ausente'
-            " 2>/dev/null)
-            if [[ "$reason" == "ip_ausente" ]]; then
-                err "iproute2 não instalado. Tentando instalar e refazer..."
-                docker exec "$name" bash -c "apt-get install -y -qq iproute2 2>/dev/null || apk add iproute2 2>/dev/null || true" 2>/dev/null
-                docker exec "$name" bash -c "ip route del default 2>/dev/null; ip route add default via $LAN_GATEWAY" 2>/dev/null \
-                    && ok "Rota configurada após instalar iproute2." \
-                    || err "Falha mesmo após instalar iproute2."
-            else
-                err "Falha ao configurar rota. Verifique se o container tem NET_ADMIN."
-            fi
+            err "Todos os métodos falharam."
+            info "Instale nsenter no host: apt-get install util-linux"
+            info "Ou recriar o container (opção 5 + 1) corrige permanentemente."
         }
+}
+
+net_fix_ssh() {
+    # Instala e inicia SSH no container SEM depender de conectividade prévia.
+    # Usa nsenter para entrar no namespace do container pelo host e acionar
+    # o apt-get/apk de lá — que já tem rota configurada pelo host.
+    local name=$1
+    log "Verificando e corrigindo SSH em '${name}'..."
+
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        err "Container '${name}' não está rodando."; return 1
+    fi
+
+    local pid
+    pid=$(docker inspect -f '{{.State.Pid}}' "$name" 2>/dev/null)
+    if [[ -z "$pid" || "$pid" == "0" ]]; then
+        err "Sem PID — container não está rodando."; return 1
+    fi
+
+    # ── Passo 1: checar se sshd já está rodando ────────────────────────────
+    if docker exec "$name" bash -c 'pgrep -x sshd >/dev/null 2>&1' 2>/dev/null; then
+        ok "sshd já está rodando em '${name}'."
+        return 0
+    fi
+    info "sshd não está rodando. Instalando e configurando..."
+
+    # ── Passo 2: garantir rota antes de qualquer apt-get ──────────────────
+    # Chama net_fix_route que já tem os 4 métodos sem dependência de rede
+    net_fix_route "$name"
+
+    # ── Passo 3: instalar openssh-server dentro do container ──────────────
+    # Usa nsenter para entrar no namespace de mount+pid do container e rodar
+    # o gerenciador de pacotes DE DENTRO do container mas COM rota do host.
+    local install_ok=false
+
+    if command -v nsenter &>/dev/null; then
+        log "Instalando openssh via nsenter..."
+        nsenter -t "$pid" -m -u -i -p -- bash -c '
+            export DEBIAN_FRONTEND=noninteractive
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get update -qq 2>/dev/null
+                apt-get install -y -qq openssh-server 2>/dev/null && echo INSTALL_OK
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache openssh 2>/dev/null
+                ssh-keygen -A 2>/dev/null
+                echo INSTALL_OK
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y -q openssh-server 2>/dev/null && echo INSTALL_OK
+            elif command -v pacman >/dev/null 2>&1; then
+                pacman -Sy --noconfirm openssh 2>/dev/null && echo INSTALL_OK
+            fi
+        ' 2>/dev/null | grep -q INSTALL_OK && install_ok=true
+    fi
+
+    # Fallback: docker exec normal (funciona se a rota já foi corrigida)
+    if [[ "$install_ok" == false ]]; then
+        log "Tentando instalação via docker exec..."
+        docker exec "$name" bash -c '
+            export DEBIAN_FRONTEND=noninteractive
+            if command -v apt-get >/dev/null 2>&1; then
+                apt-get update -qq 2>/dev/null
+                apt-get install -y -qq openssh-server 2>/dev/null && echo INSTALL_OK
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache openssh 2>/dev/null; ssh-keygen -A 2>/dev/null; echo INSTALL_OK
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y -q openssh-server 2>/dev/null && echo INSTALL_OK
+            elif command -v pacman >/dev/null 2>&1; then
+                pacman -Sy --noconfirm openssh 2>/dev/null && echo INSTALL_OK
+            fi
+        ' 2>/dev/null | grep -q INSTALL_OK && install_ok=true
+    fi
+
+    if [[ "$install_ok" == false ]]; then
+        err "Não foi possível instalar openssh-server."
+        info "Tente corrigir a rota primeiro (opção 7) e rode esta opção novamente."
+        return 1
+    fi
+
+    # ── Passo 4: configurar e iniciar sshd ────────────────────────────────
+    docker exec "$name" bash -c '
+        mkdir -p /run/sshd /var/run/sshd
+
+        # Permite login root via SSH
+        cfg=/etc/ssh/sshd_config
+        sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" "$cfg" 2>/dev/null || \
+            echo "PermitRootLogin yes" >> "$cfg"
+        sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" "$cfg" 2>/dev/null || \
+            echo "PasswordAuthentication yes" >> "$cfg"
+
+        # Garante que há uma senha para root
+        echo "root:raspberry" | chpasswd 2>/dev/null || true
+
+        # Gera chaves do host se não existirem
+        ssh-keygen -A 2>/dev/null || true
+
+        # Inicia sshd
+        sshd_bin=$(command -v /usr/sbin/sshd || command -v sshd)
+        "$sshd_bin" 2>/dev/null && echo SSHD_OK || echo SSHD_FAIL
+    ' 2>/dev/null | grep -q SSHD_OK \
+        && ok "sshd iniciado em '${name}'." \
+        || err "Instalado mas falhou ao iniciar. Verifique: docker exec -it ${name} bash -c 'sshd -t'"
+
+    # ── Passo 5: confirmar que está aceitando conexões ─────────────────────
+    local ip; ip=$(conf_get "$name" 3)
+    sleep 1
+    if nc -z -w3 "$ip" 22 2>/dev/null; then
+        ok "Porta 22 aberta em ${ip} — SSH pronto!"
+        echo -e "  ${DIM}Acesso:${RST} ssh root@${ip}  ${DIM}(senha: raspberry)${RST}"
+    else
+        warn "Porta 22 não responde ainda. O sshd pode estar inicializando — tente em alguns segundos."
+    fi
 }
 
 net_config_menu() {
@@ -1062,10 +1267,11 @@ net_config_menu() {
         echo -e "  ${C}4)${RST} Alterar servidores DNS"
         echo -e "  ${C}5)${RST} Corrigir DNS agora (reescreve resolv.conf)"
         echo ""
-        echo -e "  ${W}Diagnóstico:${RST}"
+        echo -e "  ${W}Diagnóstico e reparo:${RST}"
         echo -e "  ${B}6)${RST} Diagnóstico completo de rede"
         echo -e "  ${B}7)${RST} Corrigir rota default (gateway)"
         echo -e "  ${B}8)${RST} Aplicar política salva agora"
+        echo -e "  ${G}9)${RST} Instalar / corrigir SSH no container"
         echo ""
         echo -e "  ${DIM}q) Voltar${RST}"
         echo -n "  Opção: "; read -r nopt
@@ -1119,6 +1325,7 @@ net_config_menu() {
                net_fix_dns "$name"
                [[ "$saved_internet" != "none" ]] && net_fix_route "$name"
                ;;
+            9) net_fix_ssh "$name" ;;
             q|Q) return ;;
             *) warn "Opção inválida." ;;
         esac
