@@ -517,10 +517,17 @@ remove_macvlan() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 save_container() {
-    local name=$1 image=$2 ip=$3 auto=$4 usb=${5:-""}
+    # nome|imagem|ip|autostart|usb_flags|internet|dns
+    local name=$1 image=$2 ip=$3 auto=$4 usb=${5:-""} internet=${6:-"yes"} dns=${7:-"8.8.8.8,1.1.1.1"}
     grep -v "^${name}|" "$CONTAINERS_CONF" > "${CONTAINERS_CONF}.tmp" 2>/dev/null || true
-    echo "${name}|${image}|${ip}|${auto}|${usb}" >> "${CONTAINERS_CONF}.tmp"
+    echo "${name}|${image}|${ip}|${auto}|${usb}|${internet}|${dns}" >> "${CONTAINERS_CONF}.tmp"
     mv "${CONTAINERS_CONF}.tmp" "$CONTAINERS_CONF"
+}
+
+conf_get() {
+    # conf_get <nome_container> <campo: 1=nome 2=image 3=ip 4=auto 5=usb 6=internet 7=dns>
+    local name=$1 field=$2
+    grep "^${name}|" "$CONTAINERS_CONF" 2>/dev/null | cut -d'|' -f"${field}"
 }
 
 remove_container_conf() {
@@ -542,7 +549,8 @@ except: print('')
 
 create_container_run() {
     # Cria e sobe o container com base nos parâmetros
-    local name=$1 image=$2 ip=$3 usb_flags="${4:-}"
+    # Args: name image ip usb_flags internet dns
+    local name=$1 image=$2 ip=$3 usb_flags="${4:-}" internet="${5:-yes}" dns="${6:-8.8.8.8,1.1.1.1}"
     local data_dir="$DATA_BASE/$name"
     mkdir -p "$data_dir/data" "$data_dir/tools"
 
@@ -551,6 +559,16 @@ create_container_run() {
     if [[ -n "${usb_flags// /}" ]]; then
         read -ra usb_args <<< "$usb_flags"
     fi
+
+    # Monta flags de rede extras
+    local -a net_args=()
+    # DNS sempre explícito para evitar herdar resolv.conf quebrado do host
+    IFS=',' read -ra dns_servers <<< "$dns"
+    for srv in "${dns_servers[@]}"; do
+        [[ -n "${srv// /}" ]] && net_args+=("--dns=${srv// /}")
+    done
+    # Sem internet: adiciona --network=none depois de criar, via pós-configuração
+    # (macvlan não suporta --network=none direto; bloqueio é feito via iptables dentro do container)
 
     docker run -d \
         --name "$name" \
@@ -563,8 +581,10 @@ create_container_run() {
         -v "${data_dir}/data:/root/persistent" \
         -v "${data_dir}/tools:/opt/tools" \
         -e LANG=pt_BR.UTF-8 \
+        -e CONTAINER_INTERNET="$internet" \
         --restart=unless-stopped \
         "${usb_args[@]+"${usb_args[@]}"}" \
+        "${net_args[@]+"${net_args[@]}"}" \
         "$image" \
         bash -c '
             export DEBIAN_FRONTEND=noninteractive
@@ -587,6 +607,18 @@ create_container_run() {
             sed -i "s/PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true
             (which /usr/sbin/sshd && /usr/sbin/sshd) 2>/dev/null \
                 || (which sshd && sshd) 2>/dev/null || true
+            # Configura internet conforme flag
+            if [[ "$CONTAINER_INTERNET" == "no" ]]; then
+                # Bloqueia saída para internet mantendo LAN acessível
+                iptables -F OUTPUT 2>/dev/null || true
+                # Permite loopback e LAN local
+                iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+                iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
+                iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
+                iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
+                # Bloqueia todo o resto (internet)
+                iptables -A OUTPUT -j DROP 2>/dev/null || true
+            fi
             tail -f /dev/null
         ' 2>&1
 }
@@ -653,6 +685,41 @@ add_new_container() {
     local usb_flags=""
     [[ "$usb_ask" =~ ^[sS]$ ]] && usb_flags=$(select_usb_for_container)
 
+    # Internet
+    echo ""
+    echo -e "  ${W}Acesso à internet:${RST}"
+    echo -e "  ${C}1)${RST} Habilitada (container acessa a internet normalmente)"
+    echo -e "  ${C}2)${RST} Apenas LAN (bloqueia internet, mantém acesso à rede local)"
+    echo -e "  ${C}3)${RST} Sem rede (isolado completamente — sem LAN nem internet)"
+    echo -n "  Escolha [1]: "; read -r inet_opt
+    local internet="yes" net_mode="completa"
+    case "${inet_opt:-1}" in
+        2) internet="lan-only"; net_mode="apenas LAN" ;;
+        3) internet="none";     net_mode="sem rede" ;;
+        *) internet="yes";      net_mode="completa" ;;
+    esac
+
+    # DNS
+    local dns="8.8.8.8,1.1.1.1"
+    if [[ "$internet" == "yes" || "$internet" == "lan-only" ]]; then
+        echo -e "
+  ${W}Servidores DNS:${RST}"
+        echo -e "  ${C}1)${RST} Google        (8.8.8.8, 8.8.4.4)"
+        echo -e "  ${C}2)${RST} Cloudflare    (1.1.1.1, 1.0.0.1)"
+        echo -e "  ${C}3)${RST} Gateway/roteador (${LAN_GATEWAY})"
+        echo -e "  ${C}4)${RST} OpenDNS       (208.67.222.222, 208.67.220.220)"
+        echo -e "  ${C}5)${RST} Digitar manualmente"
+        echo -n "  Escolha [1]: "; read -r dns_opt
+        case "${dns_opt:-1}" in
+            2) dns="1.1.1.1,1.0.0.1" ;;
+            3) dns="$LAN_GATEWAY" ;;
+            4) dns="208.67.222.222,208.67.220.220" ;;
+            5) echo -n "  DNS (separados por vírgula): "; read -r dns_in
+               [[ -n "$dns_in" ]] && dns="$dns_in" ;;
+            *) dns="8.8.8.8,8.8.4.4" ;;
+        esac
+    fi
+
     # Baixa imagem se necessário
     if ! docker image inspect "$image" &>/dev/null 2>&1; then
         log "Imagem '${image}' não encontrada localmente. Baixando..."
@@ -665,16 +732,21 @@ add_new_container() {
     ensure_macvlan
     ensure_host_bridge
 
-    log "Criando container '${name}' com IP ${suggested_ip}..."
-    if create_container_run "$name" "$image" "$suggested_ip" "$usb_flags"; then
-        save_container "$name" "$image" "$suggested_ip" "$autostart" "$usb_flags"
+    log "Criando container '${name}' com IP ${suggested_ip} · internet: ${net_mode}..."
+    if create_container_run "$name" "$image" "$suggested_ip" "$usb_flags" "$internet" "$dns"; then
+        save_container "$name" "$image" "$suggested_ip" "$autostart" "$usb_flags" "$internet" "$dns"
         ip route add "${suggested_ip}/32" dev macvlan0 2>/dev/null || true
         [[ "$autostart" == "yes" ]] && install_container_service "$name"
 
+        # Aplica isolamento de rede imediato se necessário
+        [[ "$internet" != "yes" ]] && apply_net_policy "$name" "$internet"
+
         ok "Container '${name}' criado com sucesso!"
-        echo -e "  ${DIM}IP    :${RST} ${C}${suggested_ip}${RST}"
-        echo -e "  ${DIM}SSH   :${RST} ssh root@${suggested_ip}  ${DIM}(senha: raspberry)${RST}"
-        echo -e "  ${DIM}Shell :${RST} sudo docker exec -it ${name} bash"
+        echo -e "  ${DIM}IP      :${RST} ${C}${suggested_ip}${RST}"
+        echo -e "  ${DIM}Internet:${RST} ${net_mode}"
+        echo -e "  ${DIM}DNS     :${RST} ${dns}"
+        echo -e "  ${DIM}SSH     :${RST} ssh root@${suggested_ip}  ${DIM}(senha: raspberry)${RST}"
+        echo -e "  ${DIM}Shell   :${RST} sudo docker exec -it ${name} bash"
     else
         err "Falha ao criar container '${name}'."
     fi
@@ -754,6 +826,230 @@ update_container_image() {
     else
         err "Falha ao recriar. Dados em $DATA_BASE/$name estão intactos."
     fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONFIGURAÇÃO DE REDE DOS CONTAINERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+apply_net_policy() {
+    # Aplica política de internet a um container em execução
+    # apply_net_policy <nome> <internet: yes|lan-only|none>
+    local name=$1 policy="${2:-yes}"
+
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        warn "Container '${name}' não está rodando. A política será aplicada na próxima inicialização."
+        return
+    fi
+
+    log "Aplicando política de rede '${policy}' em '${name}'..."
+
+    case "$policy" in
+        yes)
+            # Remove quaisquer regras de bloqueio anteriores
+            docker exec "$name" bash -c '
+                iptables -F OUTPUT 2>/dev/null || true
+                iptables -P OUTPUT ACCEPT 2>/dev/null || true
+            ' 2>/dev/null && ok "Internet habilitada em '${name}'."                           || warn "Não foi possível aplicar (iptables ausente na imagem?)."
+            ;;
+        lan-only)
+            # Permite LAN, bloqueia internet
+            docker exec "$name" bash -c '
+                iptables -F OUTPUT 2>/dev/null || true
+                iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null
+                iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT 2>/dev/null
+                iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT 2>/dev/null
+                iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT 2>/dev/null
+                iptables -A OUTPUT -j DROP 2>/dev/null
+            ' 2>/dev/null && ok "Modo lan-only aplicado em '${name}' (LAN OK, internet bloqueada)."                           || warn "Não foi possível aplicar iptables. Verifique se a imagem tem iptables."
+            ;;
+        none)
+            # Bloqueia tudo
+            docker exec "$name" bash -c '
+                iptables -F OUTPUT 2>/dev/null || true
+                iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null
+                iptables -A OUTPUT -j DROP 2>/dev/null
+            ' 2>/dev/null && ok "Modo isolado aplicado em '${name}' (sem rede externa)."                           || warn "Não foi possível aplicar iptables."
+            ;;
+    esac
+}
+
+check_net_policy() {
+    # Mostra política atual detectada no container
+    local name=$1
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        echo "stopped"; return
+    fi
+    local rules
+    rules=$(docker exec "$name" iptables -L OUTPUT --line-numbers -n 2>/dev/null || echo "")
+    if echo "$rules" | grep -q "DROP"; then
+        if echo "$rules" | grep -q "192.168"; then
+            echo "lan-only"
+        else
+            echo "none"
+        fi
+    else
+        echo "yes"
+    fi
+}
+
+net_diag() {
+    # Diagnóstico completo de rede de um container
+    local name=$1
+    echo -e "\n ${W}━━ Diagnóstico de Rede: ${C}${name}${RST} ${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"
+
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+        err "Container não está rodando."; return
+    fi
+
+    local ip; ip=$(conf_get "$name" 3)
+    local internet; internet=$(conf_get "$name" 6)
+    local dns; dns=$(conf_get "$name" 7)
+    local detected; detected=$(check_net_policy "$name")
+
+    printf "  %-14s %s\n" "IP:" "${C}${ip}${RST}"
+    printf "  %-14s %s\n" "Config salva:" "${internet:-não definido}"
+    printf "  %-14s %s\n" "Política ativa:" "${detected}"
+    printf "  %-14s %s\n" "DNS configurado:" "${dns:-padrão}"
+
+    echo -e "\n  ${DIM}Testando conectividade...${RST}"
+
+    # Ping gateway
+    docker exec "$name" ping -c1 -W2 "$LAN_GATEWAY" &>/dev/null 2>&1         && printf "  Gateway %-6s ${G}✔ acessível${RST}\n" "(${LAN_GATEWAY})"         || printf "  Gateway %-6s ${R}✘ sem resposta${RST}\n" "(${LAN_GATEWAY})"
+
+    # Ping DNS
+    local first_dns="${dns%%,*}"
+    docker exec "$name" ping -c1 -W2 "${first_dns:-8.8.8.8}" &>/dev/null 2>&1         && printf "  DNS     %-6s ${G}✔ acessível${RST}\n" "(${first_dns})"         || printf "  DNS     %-6s ${R}✘ sem resposta${RST}\n" "(${first_dns})"
+
+    # Resolução DNS
+    docker exec "$name" bash -c 'getent hosts google.com 2>/dev/null | head -1' 2>/dev/null         | grep -q '[0-9]'         && echo -e "  DNS resolve  ${G}✔ ok (google.com resolvido)${RST}"         || echo -e "  DNS resolve  ${R}✘ falhou (sem resolução de nome)${RST}"
+
+    # Internet (HTTP)
+    docker exec "$name" bash -c 'curl -s --max-time 4 -o /dev/null -w "%{http_code}" http://detectportal.firefox.com/success.txt 2>/dev/null' 2>/dev/null         | grep -q "200"         && echo -e "  Internet     ${G}✔ saída HTTP ok${RST}"         || echo -e "  Internet     ${R}✘ sem saída HTTP${RST}"
+
+    # Mostra /etc/resolv.conf do container
+    echo -e "\n  ${DIM}/etc/resolv.conf dentro do container:${RST}"
+    docker exec "$name" cat /etc/resolv.conf 2>/dev/null         | grep -v '^#' | grep -v '^$'         | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
+
+    echo -e "\n  ${DIM}Rotas no container:${RST}"
+    docker exec "$name" ip route 2>/dev/null         | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
+}
+
+net_fix_dns() {
+    # Reescreve /etc/resolv.conf dentro do container com os DNS configurados
+    local name=$1
+    local dns; dns=$(conf_get "$name" 7)
+    [[ -z "$dns" ]] && dns="8.8.8.8,1.1.1.1"
+
+    log "Corrigindo DNS em '${name}'..."
+    local resolv="# Gerenciado pelo container-manager"
+    IFS=',' read -ra servers <<< "$dns"
+    for s in "${servers[@]}"; do
+        [[ -n "${s// /}" ]] && resolv+="\nnameserver ${s// /}"
+    done
+
+    docker exec "$name" bash -c "printf '${resolv}\n' > /etc/resolv.conf" 2>/dev/null         && ok "DNS reescrito em '${name}': ${dns}"         || err "Falha ao reescrever DNS."
+}
+
+net_fix_route() {
+    # Garante que a rota default aponta para o gateway
+    local name=$1
+    log "Corrigindo rota default em '${name}'..."
+    docker exec "$name" bash -c "
+        ip route del default 2>/dev/null || true
+        ip route add default via $LAN_GATEWAY 2>/dev/null
+    " 2>/dev/null         && ok "Rota default -> ${LAN_GATEWAY} configurada em '${name}'."         || err "Falha ao configurar rota."
+}
+
+net_config_menu() {
+    while true; do
+        select_container "Configurar rede de qual container?" || return
+        local name="$SELECTED_CONTAINER"
+
+        local saved_internet; saved_internet=$(conf_get "$name" 6)
+        local saved_dns; saved_dns=$(conf_get "$name" 7)
+        local detected; detected=$(check_net_policy "$name")
+        [[ -z "$saved_internet" ]] && saved_internet="yes"
+        [[ -z "$saved_dns" ]]     && saved_dns="8.8.8.8,1.1.1.1"
+
+        clear
+        echo -e "\n ${P}◈ Configuração de Rede: ${C}${name}${RST}"
+        hr
+        echo -e "  Config salva  : ${W}${saved_internet}${RST}"
+        echo -e "  Política ativa: ${W}${detected}${RST}"
+        echo -e "  DNS           : ${W}${saved_dns}${RST}"
+        echo ""
+        echo -e "  ${W}Política de internet:${RST}"
+        echo -e "  ${G}1)${RST} Habilitar internet completa"
+        echo -e "  ${Y}2)${RST} Apenas LAN (sem saída para internet)"
+        echo -e "  ${R}3)${RST} Isolado (sem nenhum acesso externo)"
+        echo ""
+        echo -e "  ${W}DNS:${RST}"
+        echo -e "  ${C}4)${RST} Alterar servidores DNS"
+        echo -e "  ${C}5)${RST} Corrigir DNS agora (reescreve resolv.conf)"
+        echo ""
+        echo -e "  ${W}Diagnóstico:${RST}"
+        echo -e "  ${B}6)${RST} Diagnóstico completo de rede"
+        echo -e "  ${B}7)${RST} Corrigir rota default (gateway)"
+        echo -e "  ${B}8)${RST} Aplicar política salva agora"
+        echo ""
+        echo -e "  ${DIM}q) Voltar${RST}"
+        echo -n "  Opção: "; read -r nopt
+
+        local image; image=$(conf_get "$name" 2)
+        local ip; ip=$(conf_get "$name" 3)
+        local auto; auto=$(conf_get "$name" 4)
+        local usb; usb=$(conf_get "$name" 5)
+
+        case "$nopt" in
+            1)
+                save_container "$name" "$image" "$ip" "$auto" "$usb" "yes" "$saved_dns"
+                apply_net_policy "$name" "yes"
+                net_fix_dns "$name"
+                net_fix_route "$name"
+                ;;
+            2)
+                save_container "$name" "$image" "$ip" "$auto" "$usb" "lan-only" "$saved_dns"
+                apply_net_policy "$name" "lan-only"
+                net_fix_dns "$name"
+                net_fix_route "$name"
+                ;;
+            3)
+                save_container "$name" "$image" "$ip" "$auto" "$usb" "none" "$saved_dns"
+                apply_net_policy "$name" "none"
+                ;;
+            4)
+                echo -e "\n  ${W}Novo DNS:${RST}"
+                echo -e "  ${C}1)${RST} Google     (8.8.8.8, 8.8.4.4)"
+                echo -e "  ${C}2)${RST} Cloudflare (1.1.1.1, 1.0.0.1)"
+                echo -e "  ${C}3)${RST} Roteador   (${LAN_GATEWAY})"
+                echo -e "  ${C}4)${RST} OpenDNS    (208.67.222.222, 208.67.220.220)"
+                echo -e "  ${C}5)${RST} Manual"
+                echo -n "  Escolha: "; read -r dc
+                local new_dns
+                case "$dc" in
+                    1) new_dns="8.8.8.8,8.8.4.4" ;;
+                    2) new_dns="1.1.1.1,1.0.0.1" ;;
+                    3) new_dns="$LAN_GATEWAY" ;;
+                    4) new_dns="208.67.222.222,208.67.220.220" ;;
+                    5) echo -n "  DNS (ex: 8.8.8.8,1.1.1.1): "; read -r new_dns ;;
+                    *) warn "Opção inválida."; new_dns="$saved_dns" ;;
+                esac
+                save_container "$name" "$image" "$ip" "$auto" "$usb" "$saved_internet" "$new_dns"
+                confirm "Aplicar novo DNS agora no container em execução?"                     && { saved_dns="$new_dns"; net_fix_dns "$name"; }
+                ;;
+            5) net_fix_dns "$name" ;;
+            6) net_diag "$name" ;;
+            7) net_fix_route "$name" ;;
+            8) apply_net_policy "$name" "$saved_internet"
+               net_fix_dns "$name"
+               [[ "$saved_internet" != "none" ]] && net_fix_route "$name"
+               ;;
+            q|Q) return ;;
+            *) warn "Opção inválida." ;;
+        esac
+        pause
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -890,8 +1186,18 @@ banner() {
             [[ "$autostart" == "yes" ]] && auto_str="${G}sim${RST}" || auto_str="${DIM}não${RST}"
             [[ -n "${usb// /}" ]] && usb_mark=" ${B}[usb]${RST}"
 
+            # Indicador de internet (campo 6 do .containers.conf)
+            local full_line inet_field inet_mark=""
+            full_line=$(grep "^${name}|" "$CONTAINERS_CONF" 2>/dev/null || echo "")
+            inet_field=$(echo "$full_line" | cut -d'|' -f6)
+            case "${inet_field:-yes}" in
+                yes)      inet_mark=" ${G}[net]${RST}" ;;
+                lan-only) inet_mark=" ${Y}[lan]${RST}" ;;
+                none)     inet_mark=" ${R}[off]${RST}" ;;
+            esac
+
             printf "  ${C}%-3s${RST} %-18s %-16s " "$idx" "${name:0:17}" "${image##*/}"
-            echo -e "$ip_str   $status_str   $auto_str$usb_mark"
+            echo -e "$ip_str   $status_str   $auto_str$usb_mark$inet_mark"
             (( idx++ ))
         done < "$CONTAINERS_CONF"
         echo -e " ${W}└──────────────────────────────────────────────────────────┘${RST}"
@@ -914,6 +1220,7 @@ menu() {
     echo -e "  ${B}10${RST}) Adicionar USB a container"
     echo -e "  ${C}11${RST}) Reconfigurar rede macvlan"
     echo -e "  ${C}12${RST}) Testar conectividade (ping)"
+    echo -e "  ${C}N${RST})  Configurar rede do container (internet · DNS · diagnóstico)"
     echo ""
     echo -e " ${W}Monitor${RST}"
     echo -e "  ${P}13${RST}) Monitor ao vivo (tempo real)"
@@ -1038,6 +1345,7 @@ while true; do
         10) do_action usb ;;
         11) require_root && remove_macvlan && ensure_macvlan && ensure_host_bridge ;;
         12) do_action ping ;;
+        N|n) net_config_menu ;;
         13) monitor_live ;;
         14) show_host_resources; show_container_resources ;;
         15) do_action autostart ;;
