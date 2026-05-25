@@ -493,16 +493,43 @@ ensure_macvlan() {
 }
 
 ensure_host_bridge() {
-    ip link show macvlan0 &>/dev/null 2>&1 && return 0
-    local host_ip; host_ip=$(ip -4 addr show "$HOST_INTERFACE" 2>/dev/null \
-        | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
-    ip link add macvlan0 link "$HOST_INTERFACE" type macvlan mode bridge 2>/dev/null || true
-    ip addr add "${host_ip%.*}.254/32" dev macvlan0 2>/dev/null || true
-    ip link set macvlan0 up 2>/dev/null || true
-    [[ -f "$CONTAINERS_CONF" ]] && while IFS='|' read -r _ _ cip _ _; do
-        [[ -n "$cip" ]] && ip route add "$cip/32" dev macvlan0 2>/dev/null || true
-    done < "$CONTAINERS_CONF"
-    ok "Bridge host-side (macvlan0) configurada."
+    # ── Interface macvlan0 (Raspberry Pi <-> containers) ─────────────────────
+    if ! ip link show macvlan0 &>/dev/null 2>&1; then
+        local host_ip; host_ip=$(ip -4 addr show "$HOST_INTERFACE" 2>/dev/null \
+            | grep -oP "(?<=inet\s)\d+\.\d+\.\d+\.\d+" | head -1)
+        ip link add macvlan0 link "$HOST_INTERFACE" type macvlan mode bridge 2>/dev/null || true
+        ip addr add "${host_ip%.*}.254/32" dev macvlan0 2>/dev/null || true
+        ip link set macvlan0 up 2>/dev/null || true
+        [[ -f "$CONTAINERS_CONF" ]] && while IFS='|' read -r _ _ cip _ _; do
+            [[ -n "$cip" ]] && ip route add "$cip/32" dev macvlan0 2>/dev/null || true
+        done < "$CONTAINERS_CONF"
+        ok "Bridge host-side (macvlan0) configurada."
+    fi
+
+    # ── IP Forwarding ─────────────────────────────────────────────────────────
+    # Sem isso o kernel descarta pacotes dos containers ao invés de encaminhar.
+    if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        grep -q "net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null \
+            && sed -i "s/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/" /etc/sysctl.conf \
+            || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+        ok "IP forwarding habilitado (persistente)."
+    fi
+
+    # ── Masquerade NAT ────────────────────────────────────────────────────────
+    # Traduz o IP do container para o IP do Raspberry Pi antes de sair para o
+    # roteador. Necessário porque roteadores domésticos não têm rota estática
+    # para os IPs dos containers.
+    if ! iptables -t nat -C POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null; then
+        iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE
+        ok "Masquerade NAT ativado (${LAN_SUBNET} saindo por ${HOST_INTERFACE})."
+    fi
+
+    # Libera encaminhamento entre as interfaces
+    iptables -C FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT
+    iptables -C FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT
 }
 
 remove_macvlan() {
@@ -1240,6 +1267,58 @@ net_fix_ssh() {
     fi
 }
 
+net_fix_host_routing() {
+    # Aplica/corrige forwarding + masquerade no HOST (Raspberry Pi).
+    # Pode ser chamada manualmente quando containers existentes perdem internet.
+    require_root
+
+    echo -e "\n ${W}━━ Configuração de Roteamento do Host ━━━━━━━━━━━━━━━━━━━━━━${RST}"
+
+    # IP forwarding
+    local fwd; fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+    if [[ "$fwd" == "1" ]]; then
+        ok "IP forwarding já habilitado."
+    else
+        echo 1 > /proc/sys/net/ipv4/ip_forward
+        grep -q 'net.ipv4.ip_forward' /etc/sysctl.conf 2>/dev/null             && sed -i 's/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf             || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+        ok "IP forwarding habilitado e persistido em /etc/sysctl.conf."
+    fi
+
+    # Masquerade
+    if iptables -t nat -C POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE 2>/dev/null; then
+        ok "Masquerade já configurado."
+    else
+        iptables -t nat -A POSTROUTING -s "$LAN_SUBNET" -o "$HOST_INTERFACE" -j MASQUERADE
+        ok "Masquerade NAT adicionado (${LAN_SUBNET} → ${HOST_INTERFACE})."
+    fi
+
+    # FORWARD rules
+    iptables -C FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT 2>/dev/null         || { iptables -A FORWARD -i "$HOST_INTERFACE" -o macvlan0 -j ACCEPT
+             ok "Regra FORWARD entrada adicionada."; }
+    iptables -C FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT 2>/dev/null         || { iptables -A FORWARD -i macvlan0 -o "$HOST_INTERFACE" -j ACCEPT
+             ok "Regra FORWARD saída adicionada."; }
+
+    # Mostra estado atual
+    echo -e "\n  ${DIM}Estado atual do NAT:${RST}"
+    iptables -t nat -L POSTROUTING -n --line-numbers 2>/dev/null         | grep -E "MASQUERADE|Chain"         | while read -r line; do echo -e "    ${DIM}$line${RST}"; done
+
+    echo -e "\n  ${DIM}Estado do forwarding:${RST}"
+    echo -e "    ${DIM}ip_forward = $(cat /proc/sys/net/ipv4/ip_forward)${RST}"
+
+    echo ""
+    # Agora corrige a rota dentro de cada container running
+    local fixed=0
+    while IFS='|' read -r name _ _ _ _ inet _; do
+        [[ -z "$name" || "$inet" == "none" ]] && continue
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${name}$"; then
+            log "Corrigindo rota em '${name}'..."
+            net_fix_route "$name"
+            (( fixed++ ))
+        fi
+    done < "$CONTAINERS_CONF"
+    [[ $fixed -gt 0 ]] && ok "${fixed} container(s) com rota corrigida."                        || info "Nenhum container rodando para corrigir."
+}
+
 net_config_menu() {
     while true; do
         select_container "Configurar rede de qual container?" || return
@@ -1502,6 +1581,7 @@ menu() {
     echo -e "  ${C}11${RST}) Reconfigurar rede macvlan"
     echo -e "  ${C}12${RST}) Testar conectividade (ping)"
     echo -e "  ${C}N${RST})  Configurar rede do container (internet · DNS · diagnóstico)"
+    echo -e "  ${C}H${RST})  Corrigir roteamento do host (forwarding · NAT · masquerade)"
     echo ""
     echo -e " ${W}Monitor${RST}"
     echo -e "  ${P}13${RST}) Monitor ao vivo (tempo real)"
@@ -1627,6 +1707,7 @@ while true; do
         11) require_root && remove_macvlan && ensure_macvlan && ensure_host_bridge ;;
         12) do_action ping ;;
         N|n) net_config_menu ;;
+        H|h) net_fix_host_routing ;;
         13) monitor_live ;;
         14) show_host_resources; show_container_resources ;;
         15) do_action autostart ;;
