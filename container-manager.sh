@@ -13,9 +13,17 @@ HOST_INTERFACE="wlan0"
 LAN_SUBNET="192.168.1.0/24"
 LAN_GATEWAY="192.168.1.1"
 MACVLAN_NET="pi-macvlan"
+BRIDGE_NET="pi-bridge"
+BRIDGE_SUBNET="172.20.0.0/16"
+BRIDGE_GATEWAY="172.20.0.1"
 DATA_BASE="$HOME/containers"
 LOG_FILE="/var/log/container-manager.log"
 SERVICE_PREFIX="pi-container"
+
+# Modo de rede padrão para novos containers:
+#   bridge  = funciona em Wi-Fi e Ethernet. Internet OK. Acesso externo via port forward.
+#   macvlan = container ganha IP próprio na LAN. SÓ funciona bem em Ethernet cabeada.
+DEFAULT_NET_MODE="bridge"
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ARQUIVOS DE ESTADO
@@ -479,6 +487,18 @@ select_usb_for_container() {
 #  REDE MACVLAN
 # ─────────────────────────────────────────────────────────────────────────────
 
+ensure_bridge() {
+    # Cria uma rede bridge customizada para containers
+    docker network ls --format '{{.Name}}' 2>/dev/null | grep -q "^${BRIDGE_NET}$" && return 0
+    log "Criando rede bridge '${BRIDGE_NET}'..."
+    docker network create -d bridge \
+        --subnet="$BRIDGE_SUBNET" \
+        --gateway="$BRIDGE_GATEWAY" \
+        "$BRIDGE_NET" \
+        || die "Falha ao criar rede bridge."
+    ok "Rede bridge criada (${BRIDGE_SUBNET})."
+}
+
 ensure_macvlan() {
     docker network ls --format '{{.Name}}' 2>/dev/null | grep -q "^${MACVLAN_NET}$" && return 0
     log "Criando rede macvlan '${MACVLAN_NET}'..."
@@ -539,10 +559,10 @@ remove_macvlan() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 save_container() {
-    # nome|imagem|ip|autostart|usb_flags|internet|dns
-    local name=$1 image=$2 ip=$3 auto=$4 usb=${5:-""} internet=${6:-"yes"} dns=${7:-"8.8.8.8,1.1.1.1"}
+    # nome|imagem|ip|autostart|usb_flags|internet|dns|net_mode|ports
+    local name=$1 image=$2 ip=$3 auto=$4 usb=${5:-""} internet=${6:-"yes"} dns=${7:-"8.8.8.8,1.1.1.1"} net_mode=${8:-"bridge"} ports=${9:-""}
     grep -v "^${name}|" "$CONTAINERS_CONF" > "${CONTAINERS_CONF}.tmp" 2>/dev/null || true
-    echo "${name}|${image}|${ip}|${auto}|${usb}|${internet}|${dns}" >> "${CONTAINERS_CONF}.tmp"
+    echo "${name}|${image}|${ip}|${auto}|${usb}|${internet}|${dns}|${net_mode}|${ports}" >> "${CONTAINERS_CONF}.tmp"
     mv "${CONTAINERS_CONF}.tmp" "$CONTAINERS_CONF"
 }
 
@@ -570,33 +590,53 @@ except: print('')
 }
 
 create_container_run() {
-    # Cria e sobe o container com base nos parâmetros
-    # Args: name image ip usb_flags internet dns
-    local name=$1 image=$2 ip=$3 usb_flags="${4:-}" internet="${5:-yes}" dns="${6:-8.8.8.8,1.1.1.1}"
+    # Args: name image ip usb_flags internet dns net_mode ports
+    local name=$1 image=$2 ip=$3 usb_flags="${4:-}" internet="${5:-yes}" dns="${6:-8.8.8.8,1.1.1.1}" net_mode="${7:-bridge}" ports="${8:-}"
     local data_dir="$DATA_BASE/$name"
     mkdir -p "$data_dir/data" "$data_dir/tools"
 
-    # Converte usb_flags string para array — evita word-splitting com valores vazios
     local -a usb_args=()
     if [[ -n "${usb_flags// /}" ]]; then
         read -ra usb_args <<< "$usb_flags"
     fi
 
-    # Monta flags de rede extras
+    # DNS args (apenas para modo bridge — macvlan herda da rede)
     local -a net_args=()
-    # DNS sempre explícito para evitar herdar resolv.conf quebrado do host
     IFS=',' read -ra dns_servers <<< "$dns"
     for srv in "${dns_servers[@]}"; do
         [[ -n "${srv// /}" ]] && net_args+=("--dns=${srv// /}")
     done
-    # Sem internet: adiciona --network=none depois de criar, via pós-configuração
-    # (macvlan não suporta --network=none direto; bloqueio é feito via iptables dentro do container)
 
-    # Passa gateway e política para dentro do container via env
+    # Configuração específica do modo de rede
+    local -a mode_args=()
+    case "$net_mode" in
+        bridge)
+            ensure_bridge
+            mode_args+=("--network" "$BRIDGE_NET")
+            # IP interno no bridge (não na LAN)
+            local internal_ip="${BRIDGE_GATEWAY%.*}.$(echo "$ip" | awk -F. '{print $4}')"
+            mode_args+=("--ip" "$internal_ip")
+            # Port forwarding: cada porta vira -p HOST_PORT:CONTAINER_PORT
+            # SSH sempre exposto na porta calculada (2200 + último octeto do IP)
+            local ssh_port=$((2200 + $(echo "$ip" | awk -F. '{print $4}')))
+            mode_args+=("-p" "${ssh_port}:22")
+            # Portas extras configuradas
+            if [[ -n "$ports" ]]; then
+                IFS=',' read -ra extra_ports <<< "$ports"
+                for p in "${extra_ports[@]}"; do
+                    [[ -n "${p// /}" ]] && mode_args+=("-p" "${p// /}")
+                done
+            fi
+            ;;
+        macvlan)
+            ensure_macvlan
+            ensure_host_bridge
+            mode_args+=("--network" "$MACVLAN_NET" "--ip" "$ip")
+            ;;
+    esac
+
     docker run -d \
         --name "$name" \
-        --network "$MACVLAN_NET" \
-        --ip "$ip" \
         --hostname "$name" \
         --privileged \
         --cap-add=NET_ADMIN \
@@ -606,14 +646,15 @@ create_container_run() {
         -e LANG=pt_BR.UTF-8 \
         -e CONTAINER_INTERNET="$internet" \
         -e CONTAINER_GW="$LAN_GATEWAY" \
+        -e CONTAINER_NET_MODE="$net_mode" \
         --restart=unless-stopped \
+        "${mode_args[@]+"${mode_args[@]}"}" \
         "${usb_args[@]+"${usb_args[@]}"}" \
         "${net_args[@]+"${net_args[@]}"}" \
         "$image" \
         bash -c '
             export DEBIAN_FRONTEND=noninteractive
 
-            # ── 1. Instala pacotes essenciais ──────────────────────────────
             if command -v apt-get >/dev/null 2>&1; then
                 apt-get update -qq 2>/dev/null
                 apt-get install -y -qq \
@@ -630,7 +671,6 @@ create_container_run() {
                 zypper -n install openssh iproute2 iputils curl wget iptables 2>/dev/null || true
             fi
 
-            # ── 2. Configura SSH ───────────────────────────────────────────
             mkdir -p /run/sshd /var/run/sshd
             echo "root:raspberry" | chpasswd 2>/dev/null || true
             sed -i "s/#PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config 2>/dev/null || true
@@ -638,19 +678,19 @@ create_container_run() {
             (which /usr/sbin/sshd && /usr/sbin/sshd) 2>/dev/null \
                 || (which sshd && sshd) 2>/dev/null || true
 
-            # ── 3. Configura rota default (macvlan não injeta rota) ────────
-            # O Docker com macvlan não adiciona rota default automaticamente.
-            # Precisamos configurar explicitamente via gateway da LAN.
-            GW="${CONTAINER_GW:-192.168.1.1}"
-            ip route del default 2>/dev/null || true
-            ip route add default via "$GW" 2>/dev/null || true
+            # Modo macvlan precisa de rota default explícita
+            if [[ "$CONTAINER_NET_MODE" == "macvlan" ]]; then
+                GW="${CONTAINER_GW:-192.168.1.1}"
+                ip route del default 2>/dev/null || true
+                ip route add default via "$GW" 2>/dev/null || true
+            fi
+            # Modo bridge: o Docker já configura rota automaticamente
 
-            # ── 4. Aplica política de internet ─────────────────────────────
             case "$CONTAINER_INTERNET" in
                 lan-only)
                     iptables -F OUTPUT 2>/dev/null || true
-                    iptables -A OUTPUT -o lo            -j ACCEPT 2>/dev/null || true
-                    iptables -A OUTPUT -d 10.0.0.0/8    -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+                    iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT 2>/dev/null || true
                     iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT 2>/dev/null || true
                     iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT 2>/dev/null || true
                     iptables -A OUTPUT -j DROP 2>/dev/null || true
@@ -660,7 +700,6 @@ create_container_run() {
                     iptables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
                     iptables -A OUTPUT -j DROP 2>/dev/null || true
                     ;;
-                # yes ou qualquer outro: internet livre, nada a bloquear
             esac
 
             tail -f /dev/null
@@ -736,11 +775,11 @@ add_new_container() {
     echo -e "  ${C}2)${RST} Apenas LAN (bloqueia internet, mantém acesso à rede local)"
     echo -e "  ${C}3)${RST} Sem rede (isolado completamente — sem LAN nem internet)"
     echo -n "  Escolha [1]: "; read -r inet_opt
-    local internet="yes" net_mode="completa"
+    local internet="yes" net_mode_desc="completa"
     case "${inet_opt:-1}" in
-        2) internet="lan-only"; net_mode="apenas LAN" ;;
-        3) internet="none";     net_mode="sem rede" ;;
-        *) internet="yes";      net_mode="completa" ;;
+        2) internet="lan-only"; net_mode_desc="apenas LAN" ;;
+        3) internet="none";     net_mode_desc="sem rede" ;;
+        *) internet="yes";      net_mode_desc="completa" ;;
     esac
 
     # DNS
@@ -764,6 +803,25 @@ add_new_container() {
         esac
     fi
 
+    # ── Modo de rede ──────────────────────────────────────────────────────
+    echo ""
+    echo -e "  ${W}Modo de rede:${RST}"
+    echo -e "  ${G}1)${RST} bridge   ${DIM}(recomendado — funciona em Wi-Fi e Ethernet)${RST}"
+    echo -e "  ${C}2)${RST} macvlan  ${DIM}(IP próprio na LAN — SÓ funciona bem em Ethernet)${RST}"
+    echo -n "  Escolha [1]: "; read -r net_opt
+    local net_mode="bridge"
+    [[ "$net_opt" == "2" ]] && net_mode="macvlan"
+
+    # ── Port forwarding (apenas modo bridge) ──────────────────────────────
+    local ports=""
+    if [[ "$net_mode" == "bridge" ]]; then
+        local ssh_port=$((2200 + $(echo "$suggested_ip" | awk -F. '{print $4}')))
+        echo ""
+        info "Modo bridge usa port forwarding."
+        echo -e "  SSH será exposto em: ${C}<IP_do_raspberry>:${ssh_port}${RST}"
+        echo -n "  Portas extras? (ex: 8080:80,3306:3306 ou Enter): "; read -r ports
+    fi
+
     # Baixa imagem se necessário
     if ! docker image inspect "$image" &>/dev/null 2>&1; then
         log "Imagem '${image}' não encontrada localmente. Baixando..."
@@ -773,23 +831,28 @@ add_new_container() {
         confirm "Verificar se há atualização disponível?" && docker pull "$image"
     fi
 
-    ensure_macvlan
-    ensure_host_bridge
-
-    log "Criando container '${name}' com IP ${suggested_ip} · internet: ${net_mode}..."
-    if create_container_run "$name" "$image" "$suggested_ip" "$usb_flags" "$internet" "$dns"; then
-        save_container "$name" "$image" "$suggested_ip" "$autostart" "$usb_flags" "$internet" "$dns"
-        ip route add "${suggested_ip}/32" dev macvlan0 2>/dev/null || true
+    log "Criando container '${name}' (modo: ${net_mode}, internet: ${net_mode_desc})..."
+    if create_container_run "$name" "$image" "$suggested_ip" "$usb_flags" "$internet" "$dns" "$net_mode" "$ports"; then
+        save_container "$name" "$image" "$suggested_ip" "$autostart" "$usb_flags" "$internet" "$dns" "$net_mode" "$ports"
+        [[ "$net_mode" == "macvlan" ]] && ip route add "${suggested_ip}/32" dev macvlan0 2>/dev/null || true
         [[ "$autostart" == "yes" ]] && install_container_service "$name"
-
-        # Aplica isolamento de rede imediato se necessário
         [[ "$internet" != "yes" ]] && apply_net_policy "$name" "$internet"
 
         ok "Container '${name}' criado com sucesso!"
-        echo -e "  ${DIM}IP      :${RST} ${C}${suggested_ip}${RST}"
-        echo -e "  ${DIM}Internet:${RST} ${net_mode}"
-        echo -e "  ${DIM}DNS     :${RST} ${dns}"
-        echo -e "  ${DIM}SSH     :${RST} ssh root@${suggested_ip}  ${DIM}(senha: raspberry)${RST}"
+        echo ""
+        if [[ "$net_mode" == "bridge" ]]; then
+            local ssh_port=$((2200 + $(echo "$suggested_ip" | awk -F. '{print $4}')))
+            local host_lan_ip; host_lan_ip=$(ip -4 addr show "$HOST_INTERFACE" 2>/dev/null | grep -oP '(?<=inet\s)\d+\.\d+\.\d+\.\d+' | head -1)
+            echo -e "  ${DIM}Modo    :${RST} bridge + port forward"
+            echo -e "  ${DIM}IP int. :${RST} ${C}${BRIDGE_GATEWAY%.*}.$(echo "$suggested_ip" | awk -F. '{print $4}')${RST} (dentro do bridge Docker)"
+            echo -e "  ${DIM}SSH     :${RST} ssh root@${host_lan_ip} -p ${ssh_port}  ${DIM}(senha: raspberry)${RST}"
+            [[ -n "$ports" ]] && echo -e "  ${DIM}Portas  :${RST} ${ports}"
+        else
+            echo -e "  ${DIM}Modo    :${RST} macvlan (IP próprio na LAN)"
+            echo -e "  ${DIM}IP      :${RST} ${C}${suggested_ip}${RST}"
+            echo -e "  ${DIM}SSH     :${RST} ssh root@${suggested_ip}  ${DIM}(senha: raspberry)${RST}"
+        fi
+        echo -e "  ${DIM}Internet:${RST} ${net_mode_desc}"
         echo -e "  ${DIM}Shell   :${RST} sudo docker exec -it ${name} bash"
     else
         err "Falha ao criar container '${name}'."
